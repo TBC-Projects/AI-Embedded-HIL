@@ -1,4 +1,5 @@
 # Project Title  
+AI Embedded Hardware In-the-Loop Project.
 
 ## Introduction
 This document is intended to provide a comprehensive overview of our project's developments and serve as a reference tool for new members joining our team.
