@@ -1,9 +1,4 @@
-<<<<<<< Updated upstream
-# Project Title  
-AI Embedded Hardware In-the-Loop Project.
-=======
 # AI Embedded Hardware-in-the-Loop
->>>>>>> Stashed changes
 
 ## Introduction
 This document is intended to provide a comprehensive overview of our project's developments and serve as a reference tool for new members joining our team.
@@ -23,35 +18,14 @@ This report serves two primary functions:
 
 ## Accomplishments
 
-* Deliverables: Bare-metal code generation, UART flash onto the Pi Zero W, FPGA trace capture, and a closed loop that revises firmware from hardware feedback.
-* Outcome: In progress.
 
 ## Challenges Faced
 
-* Matching generated firmware against real pin timing
-  * Solution: FPGA capture of GPIO and bus lines, with the trace returned to the agent
-  * Lesson Learned: Ongoing
-* Hung or failed firmware stalling the test loop
-  * Solution: UART bootloader with CRC32, a runner watchdog, and a hardware reset
-  * Lesson Learned: Ongoing
-
 ## Potential Improvements
 
-* Extend the loop to monitor system health on edge devices, including KV-cache and data movement
-* Synthesize timing-sensitive bare-metal protocols such as HDMI, Bluetooth, and USB from specification documents
-* Scale from one runner to a farm of 5–10 target boards for parallel RTOS tests
 
-## Relevant Resources [**IMPORTANT**]
+## Relevant Resources
 
-* Key files: `doc/architecture.md`, `doc/hardware.md`, `doc/roadmap.md`, `src/`
-* Software/platforms used, and their purpose
-  * Application stack is not chosen yet
-* Languages: C, C++ for target firmware. HDL for the FPGA capture core.
-* Hardware
-  1. FPGA - PYNQ-Z2 (Xilinx Zynq-7000) or DE1-SoC
-  2. Target microcontrollers - Raspberry Pi Zero W
-  3. Prototyping hardware - breadboards, jumper wires, logic level shifters
-  4. Debug interface - FT2232H USB-to-JTAG/UART adapter
 
 ## Other Information
 
@@ -62,6 +36,6 @@ This report serves two primary functions:
   * GPIO - General-Purpose Input/Output
   * UART - Universal Asynchronous Receiver-Transmitter
 * Team Leads
-  1. name
-  2. name
-  3. name
+  1. Adelin Ma
+  2. Elias Assalif
+  3. Ruiqi Liu
