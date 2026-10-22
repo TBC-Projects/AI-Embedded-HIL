@@ -1,1 +1,35 @@
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# Toolchain containers and local build output
+*.o
+*.elf
+*.bin
+*.img
+*.map
+
+# Vivado / Vitis
+.Xil/
+*.jou
+*.log
+*.str
+*.cache/
+*.gen/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+*.tmp/
+.vivado/
+NA/
