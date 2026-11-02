@@ -9,7 +9,7 @@ flowchart LR
   orch --> runner[Runner agent]
   runner --> gcc[Cross-compiler]
   gcc --> pi[Pi Zero W]
-  pi --> fpga[PYNQ-Z2 pintrace6]
+  pi --> fpga[Basys 3 pintrace6]
   fpga --> orch
 ```
 
@@ -33,7 +33,7 @@ Raspberry Pi Zero W running the test firmware bare metal. The Week 5 bootloader 
 
 ### FPGA module
 
-PYNQ-Z2 (Zynq-7000). The `pintrace6` core is a deterministic observer on the wires between the Pi and the bench: SPI, I2C, UART, PWM, and GPIO. It timestamps edges and checks them against the assertions for that run.
+Basys 3 (Artix-7). The `pintrace6` core is a deterministic observer on the wires between the Pi and the bench: SPI, I2C, UART, PWM, and GPIO. It timestamps edges and checks them against the assertions for that run.
 
 Week 5 capture core:
 
@@ -43,11 +43,11 @@ Week 5 capture core:
 
 Week 6 host path:
 
-* AXI-Lite registers mapped into the Zynq processing system
-* A host process on the PYNQ Linux image maps those registers with `/dev/mem`
-* That process exposes capture status, arm, capture, and trace. The service stack is not chosen yet.
+* The Basys 3 has no onboard processor, so the Runner PC takes the host role the PYNQ's Zynq cores would have played
+* Capture registers are framed over the board's built-in USB-UART instead of memory-mapped
+* The Runner PC exposes capture status, arm, capture, and trace to the orchestrator. The service stack is not chosen yet.
 
-The trace path to the orchestrator is the AXI-Lite register map and this host process.
+The trace path to the orchestrator is this USB-UART link and the Runner PC process reading it.
 
 ## Closed loop
 
@@ -70,6 +70,6 @@ The stress test injects a timing bug or a wrong register bitmask into the prompt
 | Orchestrator | Runner | Job queue. The runner polls for source, builds it, and posts compile and flash results. The queue implementation is not chosen yet. |
 | Runner | Pi Zero W | UART bootloader. Binary payload, CRC32, execute from RAM. |
 | Runner | Pi reset | Week 8 hardware reset or power-cycle when the watchdog fires. |
-| Orchestrator | PYNQ-Z2 | Capture status, arm, capture, and trace from the host process. |
-| Pi GPIO | FPGA | Six milestone strobe pins plus a shared ground, landed on PMOD or Arduino headers. |
+| Orchestrator | Basys 3 | Capture status, arm, capture, and trace, relayed by the Runner PC over the board's USB-UART. |
+| Pi GPIO | FPGA | Six milestone strobe pins plus a shared ground, landed on PMOD headers. |
 | Dashboard | Orchestrator | Live reasoning steps and compile logs. The transport is not chosen yet. |
