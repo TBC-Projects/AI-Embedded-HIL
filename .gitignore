@@ -33,3 +33,9 @@ out/
 *.tmp/
 .vivado/
 NA/
+
+# Dashboard build and local credentials
+src/dashboard/dist/
+.env
+.env.*
+!.env.example
