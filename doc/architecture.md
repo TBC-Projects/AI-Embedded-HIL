@@ -1,5 +1,23 @@
 # Architecture
 
+## Current MVP boundary
+
+The dashboard is a React/TypeScript/Vite page with an independent, browser-local
+mock workflow. It plays fixed sample agent actions, build output, UART feedback,
+and a failed-test/revision/passing-test sequence. It does not execute the submitted
+task. The FastAPI skeleton exposes health and rejects task execution with HTTP 501.
+There is no active agent loop or runner service. See the component READMEs for setup.
+
+The detailed Week 5–10 design below is historical planning, not an implemented or
+agreed interface contract. Build ownership, binary format, upload/start, reset,
+serial configuration, FPGA capture, and structured results remain unresolved.
+Orchestration owns model calls and agent retries; runner owns concrete build and
+hardware operations. These backend components can initially share one process.
+The Pi executes firmware; the FPGA observes connected digital signals and explicit
+debug milestones, not arbitrary program state.
+
+## Planned architecture
+
 The platform is split into a cognitive side and a physical side. The orchestrator decides what firmware to write and how to react to a failure. The runner, the Pi, and the FPGA only build, flash, execute, and measure.
 
 ```mermaid
@@ -17,7 +35,10 @@ flowchart LR
 
 ### Web dashboard
 
-Page for the people watching a run. It shows agent reasoning, cross-compile status, generated code diffs, and timing diagrams from the FPGA trace. Week 6 is a shell that shows reasoning steps and compile logs as they happen. The interactive waveform viewer is Week 10. The dashboard stack is not chosen yet.
+Page for the people watching a run. It shows brief agent action summaries and tool
+results, never private model reasoning. The MVP uses React, TypeScript, and Vite.
+Real cross-compile status, generated code diffs, and FPGA timing diagrams remain
+future integration work. The interactive waveform viewer is outside the MVP.
 
 ### Orchestration engine
 
@@ -70,6 +91,6 @@ The stress test injects a timing bug or a wrong register bitmask into the prompt
 | Orchestrator | Runner | Job queue. The runner polls for source, builds it, and posts compile and flash results. The queue implementation is not chosen yet. |
 | Runner | Pi Zero W | UART bootloader. Binary payload, CRC32, execute from RAM. |
 | Runner | Pi reset | Week 8 hardware reset or power-cycle when the watchdog fires. |
-| Orchestrator | Basys 3 | Capture status, arm, capture, and trace, relayed by the Runner PC over the board's USB-UART. |
-| Pi GPIO | FPGA | Six milestone strobe pins plus a shared ground, landed on PMOD headers. |
-| Dashboard | Orchestrator | Live reasoning steps and compile logs. The transport is not chosen yet. |
+| Orchestrator | PYNQ-Z2 | Capture status, arm, capture, and trace from the host process. |
+| Pi GPIO | FPGA | Six milestone strobe pins plus a shared ground, landed on PMOD or Arduino headers. |
+| Dashboard | Orchestrator | Action summaries and tool/compile results. The transport is not chosen yet. |
