@@ -9,7 +9,7 @@ Follow the Week 5–10 plan for the rest of this quarter. The two-quarter outlin
 | Co-lead | Work |
 | --- | --- |
 | 1. Agent orchestration and telemetry | Scaffold the agent pipeline. The agent framework is not chosen yet. Ingest a repository and generate basic C for a target spec, starting with a GPIO register-write function. |
-| 2. FPGA logic | Synthesize `pintrace6` for the PYNQ-Z2. Check the 100 MHz timestamp counter, rising/falling trigger, and circular BRAM buffer with a testbench or a waveform generator. |
+| 2. FPGA logic | Synthesize `pintrace6` for the Basys 3. Check the 100 MHz timestamp counter, rising/falling trigger, and circular BRAM buffer with a testbench or a waveform generator. |
 | 3. Target hardware and toolchain | Stand up a bare-metal cross-compiler and custom linker script. The toolchain packaging is not chosen yet. Bring up the bare-metal UART bootloader on the Pi Zero W so it can receive a precompiled binary over serial and run it from RAM without pulling the SD card. |
 
 ### Week 6 — Communication layer and driver interfaces
@@ -17,15 +17,15 @@ Follow the Week 5–10 plan for the rest of this quarter. The two-quarter outlin
 | Co-lead | Work |
 | --- | --- |
 | 1 | Backend for the job queue and state transitions. Dashboard shell that shows agent reasoning and compile logs as they happen. Neither stack is chosen yet. |
-| 2 | Map AXI-Lite registers to the PYNQ-Z2 processing system through `/dev/mem`. Host service on the PYNQ image for capture status, arm, capture, and trace. The service stack is not chosen yet. |
+| 2 | Frame capture registers over the Basys 3's built-in USB-UART. Host service on the Runner PC for capture status, arm, capture, and trace. The service stack is not chosen yet. |
 | 3 | Runner daemon that polls the job queue, runs the cross-compiler, and performs the serial flash handshake with CRC32. |
 
 ### Week 7 — Physical handshake
 
 | Owners | Work | Exit check |
 | --- | --- | --- |
-| Leads 2 and 3 | Wire six GPIO milestone strobes and ground from the Pi Zero W to the PYNQ-Z2 PMOD or Arduino headers. | Pins named in [hardware.md](hardware.md). |
-| Leads 1 and 3 | Point the orchestrator output queue at the runner. The agent emits a C file that toggles the strobes. The runner compiles, flashes over UART, and the Pi boots. | Read the PYNQ capture and confirm the FPGA timestamps match the GPIO toggles. |
+| Leads 2 and 3 | Wire six GPIO milestone strobes and ground from the Pi Zero W to the Basys 3 PMOD headers. | Pins named in [hardware.md](hardware.md). |
+| Leads 1 and 3 | Point the orchestrator output queue at the runner. The agent emits a C file that toggles the strobes. The runner compiles, flashes over UART, and the Pi boots. | Read the Basys 3 capture over the Runner PC's USB-UART link and confirm the FPGA timestamps match the GPIO toggles. |
 
 ### Week 8 — Feedback loop and trace diffing
 
@@ -63,7 +63,7 @@ All three leads.
 | 4–6 | Verilog or VHDL for high-speed GPIO and bus capture. Shared-memory DMA buffers that move traces to the host. |
 | 7–10 | Orchestrator prompts aimed at bare-metal patterns. First dashboard for test cycles and logic traces. |
 
-Weeks 5–10 of the plan above are the schedule that replaced the overlapping part of this outline. The orchestrator hands work to the runner through a job queue. Trace readout is the AXI-Lite register map plus a host service on the PYNQ.
+Weeks 5–10 of the plan above are the schedule that replaced the overlapping part of this outline. The orchestrator hands work to the runner through a job queue. Trace readout is the Basys 3's USB-UART link plus a host service on the Runner PC.
 
 ### Quarter 2 — Closed loop and refinement
 

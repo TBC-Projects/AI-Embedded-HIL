@@ -12,7 +12,7 @@ This report serves two primary functions:
 
 * Project Title: AI Embedded Hardware-in-the-Loop
 * Project Purpose: Autonomously write bare-metal C/C++ for a target microcontroller, flash it onto physical hardware, and verify real-time behavior with FPGA-assisted hardware-in-the-loop testing. When a run fails, the system uses the captured trace to revise the source until the checks pass.
-* Brief Description: An orchestration engine turns a hardware specification into firmware. A runner cross-compiles and flashes a Raspberry Pi Zero W. A PYNQ-Z2 FPGA records pin timing and logic state and returns a trace for the next revision. Inspired by [Sentinel](https://devpost.com/software/sentinel-c8ki50).
+* Brief Description: An orchestration engine turns a hardware specification into firmware. A runner cross-compiles and flashes a Raspberry Pi Zero W. A Basys 3 FPGA records pin timing and logic state and returns a trace for the next revision over its onboard USB-UART. Inspired by [Sentinel](https://devpost.com/software/sentinel-c8ki50).
 * Contributors Involved: name, name, name
 * Git Repo Link: https://github.com/TBC-Projects/AI-Embedded-HIL
 
