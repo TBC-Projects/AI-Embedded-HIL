@@ -91,6 +91,6 @@ The stress test injects a timing bug or a wrong register bitmask into the prompt
 | Orchestrator | Runner | Job queue. The runner polls for source, builds it, and posts compile and flash results. The queue implementation is not chosen yet. |
 | Runner | Pi Zero W | UART bootloader. Binary payload, CRC32, execute from RAM. |
 | Runner | Pi reset | Week 8 hardware reset or power-cycle when the watchdog fires. |
-| Orchestrator | PYNQ-Z2 | Capture status, arm, capture, and trace from the host process. |
-| Pi GPIO | FPGA | Six milestone strobe pins plus a shared ground, landed on PMOD or Arduino headers. |
+| Orchestrator | Basys 3 | Capture status, arm, capture, and trace, relayed by the Runner PC over the board's USB-UART. |
+| Pi GPIO | FPGA | Six milestone strobe pins plus a shared ground, landed on PMOD headers. |
 | Dashboard | Orchestrator | Action summaries and tool/compile results. The transport is not chosen yet. |
