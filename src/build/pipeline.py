@@ -1,18 +1,46 @@
-"""Runs one attempt through every stage, in order:
+"""
+DELIVERABLE D8: THE PIPELINE  (do this last: it connects D1-D4)
+=============================
 
-    LLM reply -> harness -> build -> QEMU gate -> runner (only if a Pi is connected)
+BACKGROUND
+----------
+Each stage you built does one job. The pipeline runs them in order on one AI reply:
 
-It stops at the first stage that fails. The orchestrator then reads that
-result: blame=code means send .feedback to the LLM for the next attempt;
-blame=rig means retry the same code without the LLM.
+    AI reply -> harness (D1) -> build (D2) -> QEMU gate (D3) -> runner (D4, only with real hardware)
 
-Usage (from src/build/):
-    python3 pipeline.py examples/blink_reply.txt             # no hardware
-    python3 pipeline.py examples/blink_reply.txt --pi /dev/tty.usbserial-0001 --fpga /dev/tty.usbserial-XXXX
+If a stage fails, STOP: there's no point compiling code the harness rejected,
+or flashing a program that crashed in QEMU. The failing stage's .feedback is
+what gets sent back to the AI for its next try.
+
+
+WHAT TO BUILD
+-------------
+1. run_attempt(reply, attempt_dir, runner=None) -> list of StageResult
+       - Call harness.run, then build.run, then qemu_gate.run(attempt_dir / "kernel.elf").
+       - If `runner` isn't None, also call runner.flash_and_run(attempt_dir / "kernel.bin").
+       - Time each stage (time.monotonic() before and after) and store it in result.seconds.
+       - Stop after the first result whose .ok is False.
+       - Return the results of every stage that ran.
+
+2. A command-line program, so anyone can try it (argparse is good for this):
+       python3 pipeline.py examples/blink_reply.txt
+       python3 pipeline.py examples/blink_reply.txt --pi /dev/tty.usbserial-XXXX --fpga /dev/tty.usbserial-YYYY
+   Save the attempt to jobs/demo/attempt-1. Print one line per stage, for example:
+       [PASS] harness   0.01s  accepted 1 file(s)
+       [PASS] build     0.31s  kernel.bin 1148 B
+       [FAIL] qemu      5.02s  no HIL:DONE after 5s (hang or infinite loop)
+   and, after a failure, print the feedback the AI would get.
+
+
+HOW YOU KNOW YOU'RE DONE
+------------------------
+    python3 pipeline.py examples/blink_reply.txt           -> every stage passes
+    python3 pipeline.py examples/buggy_reply.txt           -> the harness rejects it
+    python3 pipeline.py examples/compile_error_reply.txt   -> the build fails with gcc's error
+    python3 pipeline.py examples/hang_reply.txt            -> QEMU reports a hang
 """
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import build
@@ -22,54 +50,11 @@ from common import StageResult
 
 
 def run_attempt(reply: str, attempt_dir: Path, runner=None) -> list[StageResult]:
-    """Run every stage on one LLM reply.
-
-    reply        the LLM's raw text
-    attempt_dir  folder to build in; it is wiped first
-    runner       a runner.Runner to also test on real hardware, or None to stop after QEMU
-
-    Returns the result of each stage that ran. If anything failed, the failure
-    is the last item.
-    """
-    stages = [
-        lambda: harness.run(reply, attempt_dir),
-        lambda: build.run(attempt_dir),
-        lambda: qemu_gate.run(attempt_dir / "kernel.elf"),
-    ]
-    if runner is not None:
-        stages.append(lambda: runner.flash_and_run(attempt_dir / "kernel.bin"))
-    # TODO (D7): add the analyzer here. It checks the runner's artifacts["trace"].
-
-    results = []
-    # TODO (D8): run each stage in order.
-    #   - Time it: started = time.monotonic() before, then set result.seconds afterwards.
-    #   - Add the result to `results`.
-    #   - If the result isn't ok, stop: later stages need the earlier ones to have passed.
-    raise NotImplementedError("TODO: run_attempt loop")
-    return results
-
-
-def main() -> None:
-    import argparse
-    parser = argparse.ArgumentParser(description="Run one LLM reply through the HIL pipeline")
-    parser.add_argument("reply", help="text file containing an LLM reply")
-    parser.add_argument("--out", default="jobs/demo/attempt-1", help="attempt folder")
-    parser.add_argument("--pi", help="Pi serial port; leave out to skip real hardware")
-    parser.add_argument("--fpga", help="Basys 3 serial port")
-    args = parser.parse_args()
-
-    runner = None
-    if args.pi:
-        from runner import Runner  # imported here so pyserial is only needed with hardware
-        runner = Runner(args.pi, args.fpga)
-
-    reply = Path(args.reply).read_text()
-    for result in run_attempt(reply, Path(args.out), runner):
-        status = "PASS" if result.ok else "FAIL"
-        print(f"[{status}] {result.stage:8s} {result.seconds:5.2f}s  {result.summary}")
-        if not result.ok:
-            print(f"\n--- feedback for the LLM (blame={result.blame}) ---\n{result.feedback}")
+    """Run the stages in order on one AI reply. Stop at the first failure."""
+    # TODO
+    raise NotImplementedError("TODO: write the pipeline")
 
 
 if __name__ == "__main__":
-    main()
+    # TODO: the command-line program
+    raise NotImplementedError("TODO: write the command-line program")

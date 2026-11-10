@@ -1,127 +1,134 @@
-"""Step 4: Harness. Turns the LLM's raw reply into a folder we can compile.
+"""
+DELIVERABLE D1: THE HARNESS
+===========================
 
-The LLM is asked to reply with one block per file, like this:
+BACKGROUND (read this first)
+----------------------------
+Our project asks an AI model (an "LLM", like ChatGPT or Claude) to write C code
+for a Raspberry Pi. The AI answers with plain text, and that text can be messy:
+extra chatter, Markdown formatting, or code that can never work on our Pi.
 
+The harness is the first stage of the pipeline. It reads the AI's text reply and
+does one of two things:
+    - REJECT it, with a short message telling the AI what to fix, or
+    - ACCEPT it, and save the code as real files in a folder so the next stage
+      (build.py) can compile them.
+
+This deliverable is pure Python text processing: no hardware and no AI calls.
+You'll mostly use strings, the `re` (regular expressions) module, and
+`pathlib` for files.
+
+
+WHAT THE AI'S REPLY LOOKS LIKE
+------------------------------
+We tell the AI to put each file under a header line "=== FILE <path> ===".
+A file's contents run until the next header, or the end of the reply:
+
+    Sure! Here is the code.             <- chatter before the first header: ignore it
     === FILE src/main.c ===
     #include "hil.h"
-    int main(void) { ... }
+    int main(void) {
+        return 0;
+    }
+    === FILE src/util.h ===
+    int add(int a, int b);
 
-The harness:
-  1. splits the reply into files
-  2. rejects the reply if it breaks a rule (see find_problem below)
-  3. writes the attempt folder:
-         attempt/
-             src/*.c, src/*.h               the LLM's files
-             start.S linker.ld hil.c hil.h  fresh copies from target/
-             reply.txt                      the raw reply, so a run can be replayed
+From that reply you should get two files:
+    "src/main.c" -> '#include "hil.h"\\nint main(void) {\\n    return 0;\\n}\\n'
+    "src/util.h" -> 'int add(int a, int b);\\n'
 
-A rejection is always blame=code: the LLM gets the reason and tries again.
-Rejecting here is much faster than waiting for gcc to fail.
+The AI often wraps code in Markdown fences even when told not to:
+    ```c
+    ...code...
+    ```
+Remove those ``` lines.
 
-Deliverable D1. Run the tests with: python3 -m pytest tests/test_harness.py
+
+RULES: REJECT THE REPLY IF...
+-----------------------------
+Our Pi runs "bare metal": there's no operating system (no Linux, no Windows).
+That means no C standard library, so `printf` and `malloc` don't exist.
+The AI must use our own helpers in target/hil.h instead.
+
+Reject the reply if:
+    1. there are no "=== FILE ... ===" headers at all
+    2. any file path isn't exactly src/<name>.c or src/<name>.h
+       (allowed: src/main.c, src/uart_helpers.h
+        NOT allowed: main.c, src/a/b.c, start.S, ../evil.c, src/notes.txt)
+    3. all the files together are bigger than 200,000 characters
+    4. the code includes a standard library header:
+       <stdio.h>  <stdlib.h>  <string.h>  <malloc.h>  <unistd.h>
+    5. the code calls printf, malloc, free or sprintf
+       -> tell the AI: "use hil_puts / hil_puthex instead"
+    6. the code mentions _start, __stack_top or __bss_start
+       (these belong to our startup code; the AI must not touch them)
+    7. there's no main function: look for "int main(void)" or "int main()"
+
+
+IF THE REPLY IS ACCEPTED
+------------------------
+Create a fresh folder at attempt_dir (if it already exists, delete it first)
+containing:
+    attempt_dir/
+        src/main.c ...                  the AI's files
+        start.S linker.ld hil.c hil.h   copied unchanged from the target/ folder
+        reply.txt                       the AI's full original reply (for debugging)
+
+
+WHAT TO RETURN
+--------------
+Every stage returns a StageResult (see common.py: read it, it's short).
+    Accepted:  StageResult("harness", True, "accepted 2 file(s)")
+    Rejected:  StageResult("harness", False, "rejected: <reason>",
+                           feedback="Your reply was rejected before compiling: <reason>")
+The feedback is what the AI will read next time, so make it clear and specific.
+
+
+SUGGESTED STEPS
+---------------
+    1. Write parse_reply() and test it with a few hand-written strings.
+    2. Add the rules one at a time. Run the tests after each one.
+    3. Write the code that creates the folder.
+    4. Try the real examples (from src/build/):
+           python3 -c "import harness; print(harness.parse_reply(open('examples/blink_reply.txt').read()))"
+
+USEFUL PYTHON TOOLS
+-------------------
+    re.finditer / re.search / re.sub   find and replace text patterns (regex101.com helps!)
+    str.splitlines, str.strip          basic string cleanup
+    pathlib.Path: mkdir(parents=True), write_text, read_text, exists
+    shutil.copy, shutil.rmtree         copy a file / delete a folder
+
+
+HOW YOU KNOW YOU'RE DONE
+------------------------
+From src/build/, run:   python3 -m pytest tests/test_harness.py -v
+The tests check:
+    - parse_reply() returns {path: contents}, and each file ends with exactly one "\\n"
+    - the summary contains "no '=== FILE" when there are no headers
+    - the summary contains "outside src/" for a bad path
+    - the summary contains "main" when main is missing
+    - the feedback contains "stdio" when <stdio.h> is used
+    - FIXED_FILES (below) are copied into the folder
 """
 from __future__ import annotations
 
-import re
-import shutil
 from pathlib import Path
 
 from common import StageResult
 
-STAGE = "harness"
-
-# Files we copy into every attempt. The LLM is never allowed to change them.
+# The folder holding the 4 files that get copied into every attempt.
 TARGET_DIR = Path(__file__).resolve().parent / "target"
 FIXED_FILES = ("start.S", "linker.ld", "hil.c", "hil.h")
 
-MAX_SOURCE_BYTES = 200_000
 
-# "=== FILE src/main.c ===" on a line of its own starts a new file.
-FILE_HEADER = re.compile(r"^=== FILE (\S+) ===\s*$", re.MULTILINE)
-
-# The LLM may only write .c and .h files directly inside src/.
-# TODO: write a regex that matches "src/<name>.c" or "src/<name>.h", where <name>
-#       is letters, digits, "_" or "-". It must NOT match "start.S", "src/a/b.c" or "../x.c".
-ALLOWED_PATH = re.compile(r"TODO")
-
-# The LLM must define main().
-# TODO: write a regex that matches "int main(void)" and "int main()", with any spacing.
-MAIN_FUNCTION = re.compile(r"TODO")
-
-# Code patterns that can never work on our bare-metal Pi, with the reason we
-# tell the LLM. To add a rule, add a (pattern, reason) pair.
-FORBIDDEN = [
-    (re.compile(r"#\s*include\s*<(stdio|stdlib|string|malloc|unistd)\.h>"),
-     "no C standard library is available; use hil.h helpers instead"),
-    # TODO: add a rule that rejects calls to printf, malloc, free and sprintf.
-    #       Reason: "printf/malloc do not exist on bare metal; use hil_puts/hil_puthex"
-    # TODO: add a rule that rejects the startup symbols __stack_top, __bss_start and _start.
-    #       Reason: "do not touch startup symbols; start.S owns them"
-]
+def parse_reply(reply: str) -> dict[str, str]:
+    """Split the AI's reply into {file path: file contents}."""
+    # TODO
+    raise NotImplementedError("TODO: write parse_reply")
 
 
 def run(reply: str, attempt_dir: Path) -> StageResult:
-    """Check the LLM's reply and, if it's acceptable, write it to attempt_dir."""
-    files = parse_reply(reply)
-
-    problem = find_problem(files)
-    if problem:
-        return StageResult(STAGE, False, f"rejected: {problem}",
-                           feedback=f"Your reply was rejected before compiling: {problem}")
-
-    write_attempt_folder(attempt_dir, files, reply)
-    return StageResult(STAGE, True, f"accepted {len(files)} file(s)",
-                       artifacts={"files": sorted(files)})
-
-
-def parse_reply(reply: str) -> dict[str, str]:
-    """Split the reply into {path: file contents}.
-
-    Each file runs from its "=== FILE ... ===" header to the next header,
-    or to the end of the reply. Anything before the first header is ignored.
-
-    Example:
-        parse_reply("=== FILE src/a.c ===\\nA\\n=== FILE src/a.h ===\\nB\\n")
-        == {"src/a.c": "A\\n", "src/a.h": "B\\n"}
-    """
-    # TODO:
-    #   1. Find every header with FILE_HEADER.finditer(reply). Each match gives you
-    #      the path (match.group(1)) and where the header ends (match.end()).
-    #   2. A file's body runs from the end of its header to the start of the next
-    #      header (or to the end of the reply for the last one).
-    #   3. Strip blank lines from both ends of the body (body.strip("\n")), then
-    #      remove code fences with _strip_code_fence.
-    #   4. Store body + "\n" so every file ends with exactly one newline.
-    raise NotImplementedError("TODO: parse_reply")
-
-
-def _strip_code_fence(body: str) -> str:
-    """LLMs often wrap code in ```c ... ``` even when asked not to. Remove that."""
-    return re.sub(r"^```[a-zA-Z]*\s*\n|\n```\s*$", "", body)
-
-
-def find_problem(files: dict[str, str]) -> str | None:
-    """Return why these files must be rejected, or None if they look fine.
-
-    Check, in this order:
-        no files at all             -> "no '=== FILE src/<name>.c ===' blocks found"
-        a path not in ALLOWED_PATH  -> "files outside src/ are not allowed: <paths>"
-        total size > MAX_SOURCE_BYTES -> "source is too large"
-        a FORBIDDEN pattern         -> "'<matched text>' is not allowed: <reason>"
-        no MAIN_FUNCTION            -> "missing 'int main(void)'"
-    """
-    # TODO: implement each check above. Return the message for the FIRST problem found.
-    # Hint: join all files into one string to search them all at once.
-    raise NotImplementedError("TODO: find_problem")
-
-
-def write_attempt_folder(attempt_dir: Path, files: dict[str, str], reply: str) -> None:
-    """Create a fresh attempt folder with the LLM's files plus the fixed files."""
-    # TODO:
-    #   1. If attempt_dir already exists, delete it (shutil.rmtree), so files from an
-    #      older attempt never get mixed in.
-    #   2. Create attempt_dir/src (mkdir with parents=True).
-    #   3. Write each of the LLM's files to attempt_dir/<path>.
-    #   4. Copy each name in FIXED_FILES from TARGET_DIR into attempt_dir.
-    #   5. Save the raw reply as attempt_dir/reply.txt.
-    raise NotImplementedError("TODO: write_attempt_folder")
+    """Check the AI's reply. Reject it, or save its files into attempt_dir."""
+    # TODO
+    raise NotImplementedError("TODO: write the harness")
