@@ -26,7 +26,7 @@ module counter (
     logic btnU_prev, btnD_prev;
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            counter <= 1'b0;
+            counter <= '0;
         end else begin
             if (btnU & ~btnD & ~btnU_prev) begin
                 counter <= counter + 1;
@@ -38,8 +38,8 @@ module counter (
                 btnD_prev <= 1'b1;
             end
 
-            if (counter > 9 ) begin
-                counter <= 1'b0;
+            if (counter > 9) begin
+                counter <= '0;
             end
 
             btnU_prev <= btnU;
