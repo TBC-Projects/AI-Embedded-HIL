@@ -15,8 +15,8 @@ module counter (
 
     logic rst_n;
     assign led[15:0] = 16'b0;
-    assign an[3:0] = 4'b0;
-    assign seg[6:0] = 7'b1;
+    // assign an[3:0] = 4'b0;
+    // assign seg[6:0] = 7'b1;
     
     logic [7:0] counter;
     // assign btnC = counter;
@@ -25,7 +25,7 @@ module counter (
 
     logic btnU_prev, btnD_prev;
     always_ff @(posedge clk) begin
-        if (!rst_n) begin
+        if (btnC) begin
             counter <= '0;
         end else begin
             if (btnU & ~btnD & ~btnU_prev) begin
@@ -66,4 +66,74 @@ module counter (
     end
 
     // run something that sets the segments to the given counter?
+<<<<<<< Updated upstream
+=======
+endmodule
+
+module counter_testbench();
+
+    logic clk;
+    logic btnU, btnC, btnD, btnL, btnR;
+    logic [15:0] sw;
+    logic rst;
+
+    logic [15:0] led;
+    logic [3:0] an;
+    logic dp;
+    logic [6:0] seg;
+
+    // Connect testbench to counter module
+    counter dut (.*);
+
+    initial clk = 0;
+    always #5 clk = ~clk
+
+     initial begin
+        rst = 1;
+        btnU = 0;
+        btnD = 0;
+        btnC = 0;
+        btnL = 0;
+        btnR = 0;
+        sw = 0;
+
+        #12;
+        rst = 0;
+
+        // Press Up button
+        #10;
+        btnU = 1;
+        #10;
+        btnU = 0;
+
+        // Press Up again
+        #10;
+        btnU = 1;
+        #10;
+        btnU = 0;
+
+        // Press Down button
+        #10;
+        btnD = 1;
+        #10;
+        btnD = 0;
+
+        // Press Center button to reset
+        #10;
+        btnC = 1;
+        #10;
+        btnC = 0;
+
+        #20;
+        $stop;
+
+    end
+
+    // Display counter values
+    initial begin
+        $monitor("Time=%0t Counter=%0d Up=%b Down=%b Reset=%b",
+                 $time, dut.counter, btnU, btnD, rst);
+    end
+
+>>>>>>> Stashed changes
 endmodule
