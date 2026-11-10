@@ -1,0 +1,6 @@
+=== FILE src/main.c ===
+#include "hil.h"
+int main(void) {
+    hil_puts("hi\n")
+    return 0;
+}

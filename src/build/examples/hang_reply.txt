@@ -1,0 +1,8 @@
+=== FILE src/main.c ===
+#include "hil.h"
+
+int main(void) {
+    hil_puts("waiting for a timer that never fires\n");
+    while (SYSTIMER_CLO != 0xFFFFFFFFu) { }   /* effectively forever */
+    return 0;
+}
