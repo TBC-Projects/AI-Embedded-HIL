@@ -1,0 +1,24 @@
+Here is the driver.
+
+=== FILE src/main.c ===
+```c
+#include "hil.h"
+
+/* Busy-wait using the 1 MHz BCM2835 system timer. */
+static void delay_us(uint32_t us) {
+    uint32_t start = SYSTIMER_CLO;
+    while ((uint32_t)(SYSTIMER_CLO - start) < us) { }
+}
+
+int main(void) {
+    hil_puts("toggling S0 every 1000 us\n");
+    for (int i = 0; i < 50; i++) {
+        strobe_hi(0);
+        delay_us(500);
+        strobe_lo(0);
+        delay_us(500);
+    }
+    strobe_pulse(7);            /* milestone: finished */
+    return 0;
+}
+```
