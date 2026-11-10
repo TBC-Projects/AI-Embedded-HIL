@@ -85,7 +85,20 @@ def _find_sources(attempt_dir: Path) -> tuple[list[str], list[str]]:
     """
     # TODO: use attempt_dir.glob(...). Return names relative to attempt_dir, because
     #       gcc runs inside attempt_dir.
-    raise NotImplementedError("TODO: _find_sources")
+    fixed_sources = sorted(
+        path.name
+        for pattern in ("*.S", "*.c")
+        for path in attempt_dir.glob(pattern)
+        if path.is_file()
+    )
+
+    llm_sources = sorted(
+        path.relative_to(attempt_dir).as_posix()
+        for path in (attempt_dir / "src").glob("*.c")
+        if path.is_file()
+    )
+
+    return fixed_sources, llm_sources
 
 
 def _run_tool(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess | None:
