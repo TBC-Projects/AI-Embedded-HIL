@@ -15,8 +15,8 @@ module counter (
 
     logic rst_n;
     assign led[15:0] = 16'b0;
-    assign an[3:0] = 4'b0;
-    assign seg[6:0] = 7'b1;
+   // assign an[3:0] <= 4'b0;
+   // assign seg[6:0] <= 7'b1;
     
     logic [7:0] counter;
     // assign btnC = counter;
