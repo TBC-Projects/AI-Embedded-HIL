@@ -104,16 +104,89 @@ run(). Don't copy its value somewhere else when the file loads.
 """
 from __future__ import annotations
 
+from ast import main
 from pathlib import Path
-
-from common import StageResult
+import subprocess
+import zlib
+from common import StageResult, tail
 
 CC = "arm-none-eabi-gcc"            # the cross-compiler
 OBJCOPY = "arm-none-eabi-objcopy"   # turns kernel.elf into kernel.bin
 MAX_BIN_BYTES = 1 << 20             # 1 MB
-
+# everything for the arm compiler
+CFLAGS = ["-mcpu=arm1176jzf-s", "-marm", "-O2", "-g",
+          "-ffreestanding", "-nostdlib", "-fno-builtin", "-Wall", "-Wextra"]
 
 def run(attempt_dir: Path) -> StageResult:
     """Compile attempt_dir into kernel.elf and kernel.bin."""
     # TODO
-    raise NotImplementedError("TODO: write the build stage")
+    # 1. Check the input folder.
+    # we need the linker to exist and at least one source file to compile
+    # if it doesn't exist then we need to blame the harness 
+    if not (attempt_dir / "linker.ld").exists():
+        return StageResult("build", False, "linker.ld missing", blame="rig")
+
+    # gets all the support files ending in .S or .c
+    support = []
+    for path in attempt_dir.glob("*.S"):
+        support.append(path.name)
+    for path in attempt_dir.glob("*.c"):
+        support.append(path.name)
+    support.sort()
+
+    # gets all the LLM generated .c files in src/
+    llm_code = []
+    for path in attempt_dir.glob("src/*.c"):
+        llm_code.append("src/" + path.name)
+    llm_code.sort()    
+    if not llm_code:
+        return StageResult("build", False, "no src/*.c files",
+                           feedback="No C source files were provided under src/.")
+
+    # 2. Compile everything into kernel.elf.
+    cmd = [CC, *CFLAGS, "-I.", "-T", "linker.ld", *support, *llm_code, "-o", "kernel.elf", "-lgcc"]
+    try:
+        gcc = subprocess.run(cmd, cwd=attempt_dir, capture_output=True, text=True)
+    except FileNotFoundError:
+        return StageResult("build", False, f"{CC} is not installed", blame="rig")
+
+    # this step is trying to save a log of all the commands that we ran 
+    # and the output of the compiler to a file called build.log
+    # eg. arm-none-eabi-gcc -mcpu=arm1176jzf-s -marm -O2 -g ... -I. -T linker.ld hil.c start.S src/main.c -o kernel.elf -lgcc
+    # src/main.c: In function 'main':
+    # src/main.c:4:22: error: expected ';' before 'return'
+    #     4 |     hil_puts("hi\n")
+    #       |                     ^
+    #       |                     ;
+    (attempt_dir / "build.log").write_text(" ".join(cmd) + "\n\n" + gcc.stdout + gcc.stderr)
+    if gcc.returncode != 0:
+        return StageResult("build", False, "compile failed",
+                           feedback="The code did not compile:\n" + tail(gcc.stderr))
+
+    # 3. Turn kernel.elf into the raw bytes we send to the Pi.
+    objcopy = subprocess.run([OBJCOPY, "-O", "binary", "kernel.elf", "kernel.bin"],
+                             cwd=attempt_dir, capture_output=True, text=True)
+    if objcopy.returncode != 0:
+        return StageResult("build", False, "objcopy failed", blame="rig")
+
+    # 4. Check the size and compute the checksum.
+    # checksum is a networking term to check if the data was corrupted in the transmission
+    # process becuase the checksum at the pi should be the same here 
+    # max size is 1 MB because the pi has limited memory and we don't want to send too much data
+    data = (attempt_dir / "kernel.bin").read_bytes()
+    if len(data) > MAX_BIN_BYTES:
+        return StageResult("build", False, f"binary too large ({len(data)} bytes)",
+                           feedback=f"The program is {len(data)} bytes; the limit is {MAX_BIN_BYTES}.")
+
+    # return the result with the path to the kernel.elf and kernel.bin files, 
+    # the length of the binary, and the crc32 checksum
+    return StageResult("build", True, f"kernel.bin {len(data)} B", artifacts={
+        # should be used by qemu to check for correctness
+        "elf": str(attempt_dir / "kernel.elf"),
+        # should be used by the runner to send to the pi
+        "bin": str(attempt_dir / "kernel.bin"),
+        # so bootloader knows how many bytes to read
+        "length": len(data),
+        # so bootloader can check for data corruption during transmission
+        "crc32": zlib.crc32(data),
+    })
