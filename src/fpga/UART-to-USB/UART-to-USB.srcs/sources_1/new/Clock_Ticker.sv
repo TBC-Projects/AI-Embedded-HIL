@@ -47,7 +47,7 @@ module Clock_Ticker_testbench();
     logic clk, rst, startsignal, fire_signal;
     logic [9:0] cycle_length;
     
-    Clock_Ticker dut (.clk(clk), .rst(rst), .startsignal(starsignal),
+    Clock_Ticker dut (.clk(clk), .rst(rst), .startsignal(startsignal),
     .cycle_length(cycle_length), .fire_signal(fire_signal));
     
     parameter CLOCK_PERIOD = 100;
@@ -60,10 +60,41 @@ module Clock_Ticker_testbench();
     
     /*
     Test Cases:
-        
+        standard run
+        reset signal
+        startsignal signal
+        Shorter/longer cycle_length
+        multiple loops
+        reset when cycle reaches cycle_length
     */
     initial begin
+        // Test reset
+        rst <= 1; startsignal <= 0; cycle_length <= 4; repeat(1) @(posedge clk);  
+        rst <= 0; startsignal <= 0; cycle_length <= 4; repeat(10) @(posedge clk); // Standard Run, multiple cycles
         
+        // Test reset on for multiple consecutive posedge clks
+        rst <= 1; startsignal <= 0; cycle_length <= 4; repeat(6) @(posedge clk);
+        
+        // Test startsignal
+        rst <= 0; startsignal <= 1; cycle_length <= 4; repeat(1) @(posedge clk); 
+        rst <= 0; startsignal <= 0; cycle_length <= 4; repeat(8) @(posedge clk); // Standard run
+        
+        // Test reset and startsignal on at same time
+        rst <= 1; startsignal <= 1; cycle_length <= 4; repeat(4) @(posedge clk);
+        rst <= 0; startsignal <= 0; cycle_length <= 4; repeat(4) @(posedge clk);
+        
+        //Test different cycle_length size
+        rst <= 0; startsignal <= 0; cycle_length <= 7; repeat(10) @(posedge clk);  
+        
+
+        rst <= 1; startsignal <= 0; cycle_length <= 4; repeat(1) @(posedge clk);
+        
+        // Test reset when cycle reaches cycle_length
+        rst <= 0; startsignal <= 0; cycle_length <= 4; repeat(3) @(posedge clk);
+        rst <= 1; startsignal <= 0; cycle_length <= 4; repeat(1) @(posedge clk);
+        rst <= 0; startsignal <= 0; cycle_length <= 4; repeat(10) @(posedge clk);
+        
+        $stop; // Stops clock
     end
 endmodule
         

@@ -8,7 +8,7 @@
 // Module Name: uart_tx
 // Project Name: AI Embedded HIL Project
 // Target Devices: Basys3 FPGA Board
-// Tool Versions: 
+// Tool Versions: no idea what this means
 // Description: 
 // 
 // Dependencies: 
@@ -83,4 +83,28 @@ always_ff @(posedge clk) begin
 
 
 end
+endmodule
+
+//input clk, input logic rst, input start, input logic [7:0] data,
+ //output logic tx, output logic busy
+module uart_tx_testbench();
+    logic clk, rst, start, tx, busy;
+    logic [7:0] data;
+    
+    uart_tx dut (.clk(clk), .rst(rst), .start(start), .data(data), .tx(tx), .busy(busy));
+    
+    parameter CLOCK_PERIOD = 100;
+    
+    initial begin
+        clk <= 0;
+        forever #(CLOCK_PERIOD/2) clk <= ~clk; // Forever toggle the clock
+    end
+    
+    /*
+    Test Cases: 
+    Test Cases Go Here
+    */
+    initial begin
+    
+    end
 endmodule
