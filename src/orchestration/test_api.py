@@ -1,30 +1,113 @@
-"""Contract smoke tests: python -m unittest src.orchestration.test_api."""
+"""Offline API tests using the real ADK runner with a fake model transport."""
 
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from google.adk.models.llm_response import LlmResponse
+from google.genai import types
 
-from src.orchestration.main import TaskRequest, app, run_agent_loop
+from src.orchestration.main import app
+
+MODEL_METHOD = "google.adk.models.google_llm.Gemini.generate_content_async"
+
+
+def fake_model(*, try_invalid_artifacts=False):
+    """Replace only Gemini's network call; ADK still discovers and runs the tools."""
+    async def generate(model, llm_request, stream=False):
+        results = [
+            part.function_response
+            for content in llm_request.contents
+            for part in content.parts or []
+            if part.function_response
+        ]
+        if try_invalid_artifacts:
+            sequence = ["flash_before_build", "compile", "flash_wrong_id", "flash", "final"]
+        else:
+            sequence = ["compile", "flash", "final"]
+        step = sequence[len(results)]
+        if step == "compile":
+            name, args = "compile_firmware", {}
+        elif step in ("flash_before_build", "flash_wrong_id"):
+            name, args = "flash_firmware", {"artifact_id": "not-a-built-artifact"}
+        elif step == "flash":
+            build = next(result.response for result in results if result.name == "compile_firmware")
+            name, args = "flash_firmware", {"artifact_id": build["artifact_id"]}
+        else:
+            yield LlmResponse(content=types.Content(role="model", parts=[
+                types.Part(text="Private reasoning must not appear in the API.", thought=True),
+                types.Part(text="Simulated compilation and flashing succeeded. No hardware was contacted."),
+            ]))
+            return
+        yield LlmResponse(content=types.Content(role="model", parts=[
+            types.Part(function_call=types.FunctionCall(name=name, args=args)),
+        ]))
+    return generate
 
 
 class ApiTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(app)
+        # A dummy value passes our configuration check. Network calls are mocked.
+        self.environment = patch.dict("os.environ", {"GOOGLE_API_KEY": "offline-test-key"})
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def submit(self):
+        return self.client.post("/tasks", json={
+            "task": "Compile the prepared firmware, flash it if the build succeeds, and tell me what happened.",
+        })
+
     def test_health(self):
-        with TestClient(app) as client:
-            response = client.get("/health")
+        response = self.client.get("/health")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
 
-    def test_task_not_implemented(self):
-        with TestClient(app) as client:
-            response = client.post("/tasks", json={"task": "Send Hello over UART"})
-        self.assertEqual(response.status_code, 501)
-        self.assertIn("not implemented", response.json()["detail"])
-
     def test_invalid_task(self):
-        with TestClient(app) as client:
-            for body in ({}, {"task": ""}, {"task": "  "}):
-                self.assertEqual(client.post("/tasks", json=body).status_code, 422)
+        for body in ({}, {"task": ""}, {"task": "  "}, {"task": "x" * 10001}):
+            self.assertEqual(self.client.post("/tasks", json=body).status_code, 422)
 
-    def test_agent_placeholder(self):
-        with self.assertRaises(NotImplementedError):
-            run_agent_loop(TaskRequest(task="example"))
+    def test_missing_key(self):
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": ""}):
+            response = self.submit()
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("GOOGLE_API_KEY", response.json()["detail"])
+
+    def test_compile_then_flash_through_real_runner(self):
+        with patch(MODEL_METHOD, fake_model()):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertTrue(data["simulated"])
+        events = data["tool_events"]
+        self.assertEqual([event["name"] for event in events], [
+            "compile_firmware", "compile_firmware", "flash_firmware", "flash_firmware",
+        ])
+        artifact = events[1]["result"]["artifact_id"]
+        self.assertEqual(events[2]["arguments"]["artifact_id"], artifact)
+        self.assertEqual(events[3]["result"]["status"], "success")
+        self.assertNotIn("Private reasoning", data["final_response"])
+
+    def test_flash_rejects_unbuilt_and_wrong_artifacts(self):
+        with patch(MODEL_METHOD, fake_model(try_invalid_artifacts=True)):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
+        self.assertEqual([result["status"] for result in results], ["error", "success", "error", "success"])
+        self.assertTrue(all(result["simulated"] for result in results))
+
+    def test_new_task_gets_fresh_session_and_build(self):
+        with patch(MODEL_METHOD, fake_model()):
+            first, second = self.submit().json(), self.submit().json()
+        self.assertNotEqual(first["session_id"], second["session_id"])
+        self.assertNotEqual(first["tool_events"][1]["result"]["artifact_id"], second["tool_events"][1]["result"]["artifact_id"])
+
+    def test_provider_error_is_not_reported_as_success(self):
+        async def broken_model(model, llm_request, stream=False):
+            raise ConnectionError("Provider details must not be returned")
+            yield  # Make this an async generator, like the actual model method.
+
+        with patch(MODEL_METHOD, broken_model):
+            response = self.submit()
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn("Provider details", response.text)

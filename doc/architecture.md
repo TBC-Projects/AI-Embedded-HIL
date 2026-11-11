@@ -5,8 +5,11 @@
 The dashboard is a React/TypeScript/Vite page with an independent, browser-local
 mock workflow. It plays fixed sample agent actions, build output, UART feedback,
 and a failed-test/revision/passing-test sequence. It does not execute the submitted
-task. The FastAPI skeleton exposes health and rejects task execution with HTTP 501.
-There is no active agent loop or runner service. See the component READMEs for setup.
+task. FastAPI exposes health and a task endpoint using one Google ADK Agent with
+Gemini and an InMemoryRunner. Each task creates a fresh session; ordinary Python
+compile/flash tools return explicitly simulated results. The backend calls Gemini,
+but no real compilation or hardware access takes place. There is no hardware runner
+service or dashboard/backend connection. See the component READMEs for setup.
 
 The detailed Week 5–10 design below is historical planning, not an implemented or
 agreed interface contract. Build ownership, binary format, upload/start, reset,

@@ -43,7 +43,8 @@ This report serves two primary functions:
 ## Local MVP
 
 The current implementation is a browser-local demonstration plus an independent
-FastAPI skeleton. It does not call a model, compile firmware, upload binaries, or
+FastAPI endpoint using Google ADK and Gemini with simulated compile/flash tools.
+The backend calls a real model, but does not compile firmware, upload binaries, or
 access hardware. No authentication, database, or deployment is included.
 
 Frontend (Node.js 22.14+):
@@ -65,11 +66,14 @@ Backend (Python 3.10+, from the repository root):
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r src/orchestration/requirements.txt
+export GOOGLE_API_KEY='your-Google-AI-Studio-API-key'
 python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-`GET /health` returns 200. Valid `POST /tasks` requests return 501 because agent
-execution is not implemented. The frontend does not need this server running.
+`GET /health` returns 200. `POST /tasks` sends the prompt to a Gemini agent with
+simulated compile/flash tools and returns the answer and tool transcript. Try
+“Compile the prepared firmware, flash it if the build succeeds, and tell me what
+happened.” The frontend remains independent and does not need this server running.
 
 | Directory | Responsibility and integration point |
 | --- | --- |
