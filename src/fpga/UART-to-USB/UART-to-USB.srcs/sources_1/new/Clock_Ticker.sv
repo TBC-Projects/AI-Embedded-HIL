@@ -29,7 +29,7 @@ input logic [9:0] cycle_length, output logic fire_signal
 
     always_ff @(posedge clk) begin  
     if (rst || startsignal) begin
-        ticker <= 10'b0;
+        ticker <= 10'b0; 
         fire_signal <= 1'b0;
     end else if((ticker >= cycle_length - 1'b1)) begin
         ticker <= 10'b0;
