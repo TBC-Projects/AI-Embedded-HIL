@@ -71,9 +71,11 @@ python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 80
 ```
 
 `GET /health` returns 200. `POST /tasks` sends the prompt to a Gemini agent with
-simulated compile/flash tools and returns the answer and tool transcript. Try
-“Compile the prepared firmware, flash it if the build succeeds, and tell me what
-happened.” The frontend remains independent and does not need this server running.
+simulated compile/flash tools and returns the answer and tool transcript. See the
+[test prompts and long-wait notes](src/orchestration/README.md#long-waits-and-test-prompts)
+before testing: some runs have waited a long time for a final model response, and
+there is no overall backend timeout. The frontend remains independent and does
+not need this server running.
 
 | Directory | Responsibility and integration point |
 | --- | --- |

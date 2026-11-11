@@ -1,13 +1,19 @@
 """Offline API tests using the real ADK runner with a fake model transport."""
 
+import asyncio
 import unittest
+import io
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from google.adk.models.llm_response import LlmResponse
+from google.adk.models.google_llm import Gemini
+from google.adk.models.registry import LLMRegistry
 from google.genai import types
+from google.genai.errors import ClientError
 
-from src.orchestration.main import app
+from src.orchestration.main import MODEL, TaskRequest, app, run_agent_loop
 
 MODEL_METHOD = "google.adk.models.google_llm.Gemini.generate_content_async"
 
@@ -46,6 +52,10 @@ def fake_model(*, try_invalid_artifacts=False):
 
 
 class ApiTests(unittest.TestCase):
+    def test_configured_model_resolves_to_direct_gemini(self):
+        # Resolve without a network call; a models/ prefix breaks ADK routing.
+        self.assertIsInstance(LLMRegistry.new_llm(MODEL), Gemini)
+
     def setUp(self):
         self.client = TestClient(app)
         # A dummy value passes our configuration check. Network calls are mocked.
@@ -111,3 +121,70 @@ class ApiTests(unittest.TestCase):
             response = self.submit()
         self.assertEqual(response.status_code, 502)
         self.assertNotIn("Provider details", response.text)
+
+    def test_google_error_diagnostic_redacts_key(self):
+        async def rejected_model(model, llm_request, stream=False):
+            raise ClientError(400, {"error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": "API key not valid: offline-test-key",
+            }})
+            yield
+
+        output = io.StringIO()
+        with patch(MODEL_METHOD, rejected_model), redirect_stdout(output):
+            response = self.submit()
+        self.assertEqual(response.status_code, 502)
+        self.assertIn('"google_http_code": 400', output.getvalue())
+        self.assertIn("API key not valid: [REDACTED]", output.getvalue())
+        self.assertNotIn("offline-test-key", output.getvalue())
+        self.assertNotIn("offline-test-key", response.text)
+
+
+class ProgressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_waiting_logs_model_turns_and_cleans_up(self):
+        transport = fake_model()
+
+        async def slow_model(model, llm_request, stream=False):
+            await asyncio.sleep(0.04)
+            async for response in transport(model, llm_request, stream):
+                yield response
+
+        output = io.StringIO()
+        with patch(MODEL_METHOD, slow_model), patch(
+            "src.orchestration.main.PROGRESS_INTERVAL_SECONDS", 0.01,
+        ), redirect_stdout(output):
+            result = await run_agent_loop(TaskRequest(task="Compile and flash"))
+
+        text = output.getvalue()
+        self.assertIn("Creating fresh in-memory session", text)
+        self.assertIn("Still active; current stage: waiting for Gemini response #1", text)
+        self.assertIn("Received Gemini response for model call #3", text)
+        self.assertIn("Agent run completed", text)
+        self.assertIn("Runner closed; waiting updates stopped", text)
+        self.assertNotIn("Private reasoning", text)
+        self.assertTrue(result["simulated"])
+        self.assertFalse(any(
+            task.get_name().startswith("firmware-progress-")
+            for task in asyncio.all_tasks()
+        ))
+
+    async def test_failure_stops_waiting_updates(self):
+        async def broken_model(model, llm_request, stream=False):
+            await asyncio.sleep(0.04)
+            raise ConnectionError("offline failure")
+            yield
+
+        output = io.StringIO()
+        with patch(MODEL_METHOD, broken_model), patch(
+            "src.orchestration.main.PROGRESS_INTERVAL_SECONDS", 0.01,
+        ), redirect_stdout(output):
+            with self.assertRaises(ConnectionError):
+                await run_agent_loop(TaskRequest(task="Compile and flash"))
+
+        self.assertIn("failed during: waiting for Gemini response #1", output.getvalue())
+        self.assertIn("Runner closed; waiting updates stopped", output.getvalue())
+        self.assertFalse(any(
+            task.get_name().startswith("firmware-progress-")
+            for task in asyncio.all_tasks()
+        ))
