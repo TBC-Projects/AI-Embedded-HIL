@@ -2,10 +2,9 @@
 
 One Google ADK Agent and InMemoryRunner handle each task. Gemini makes real API
 calls and can use ADK's built-in ReadFile, WriteFile, and EditFile tools to create
-real local source files. compile_firmware runs the harness code rules and build.py
-(real ARM binaries); test_firmware boots that build in the QEMU gate (an emulated
-Pi Zero). The order is compile -> test -> flash. Only flash_firmware remains simulated;
-no Raspberry Pi is contacted. The dashboard still uses its separate browser-local mock workflow.
+real local source files. compile_firmware now calls src/build/build.py to produce
+real ARM binaries. Only flash_firmware remains simulated; no Raspberry Pi is
+contacted. The dashboard still uses its separate browser-local mock workflow.
 
 ## Run locally
 
@@ -31,15 +30,14 @@ In another terminal:
 curl http://127.0.0.1:8000/health
 curl -sS --max-time 90 http://127.0.0.1:8000/tasks \
   -H 'Content-Type: application/json' \
-  -d '{"task":"Write build-demo/src/main.c with int main(void) that returns 0. Call compile_firmware with project_dir build-demo. If the build succeeds, call test_firmware with the returned artifact_id. If that passes, call flash_firmware once with the same artifact_id. Report the real build and QEMU results and the simulated flash result, then finish."}' \
+  -d '{"task":"Write build-demo/src/main.c with int main(void) that returns 0. Call compile_firmware with project_dir build-demo. If the build succeeds, call flash_firmware once with the returned artifact_id. Report the real build result and simulated flash result, then finish."}' \
   | python3 -m json.tool
 ```
 
 The response contains `session_id`, `model`, `workspace`, `simulated`, `simulation_note`,
 `tool_events` (calls, arguments, and results), and `final_response`. Tool events and
 Gemini's final answer are also printed in the server terminal. `simulated: true`
-refers to flashing only; Gemini, file operations, code checks, compilation, and the
-QEMU run are real. The server logs
+refers to flashing only; Gemini, file operations, and compilation are real. The server logs
 session setup, model requests/responses, tool execution, completion/failure, and
 cleanup with a run ID and elapsed seconds. Every 10 seconds a local heartbeat
 reports the current stage; it does not imply Google is making progress. Prompts
@@ -72,61 +70,24 @@ so tell it which existing files to read. Submit tasks one at a time to avoid
 simultaneous edits to the shared files. Files are not automatically cleared.
 
 In main.py, EnvironmentToolset supplies existing ADK implementations. We select
-its three file tools and register them beside compile_firmware, test_firmware, and flash_firmware.
+its three file tools and register them beside compile_firmware and flash_firmware.
 The shell Execute tool is not registered. Gemini supplies file paths and contents
 as structured tool arguments; no code-block extractor is used. File tool calls
 and results appear in the same transcript as compile/flash, including code content.
 The compile result has `simulated: false`; the flash result has `simulated: true`.
 The top-level simulation note explains that only flashing remains simulated.
 
-## Real checks, compilation, and QEMU
+## Real compilation
 
-Install the ARM tools and QEMU if needed (no additional Python dependency is required):
+Install both ARM tools if needed (no additional Python dependency is required):
 
 ```sh
 # macOS
 brew install --cask gcc-arm-embedded
-brew install qemu
-# Ubuntu: sudo apt install gcc-arm-none-eabi qemu-system-arm
+# Ubuntu: sudo apt install gcc-arm-none-eabi
 arm-none-eabi-gcc --version
 arm-none-eabi-objcopy --version
-qemu-system-arm --version     # 6.2 or newer
 ```
-
-The agent's tools run in this order, passing the same `artifact_id` along:
-
-```
-compile_firmware(project_dir) -> test_firmware(artifact_id) -> flash_firmware(artifact_id)
-   harness + build (real)          QEMU (real)                     simulated
-```
-
-compile_firmware runs two stages and stops at the first failure. The result's
-`failed_stage` names it (`null` on success):
-
-| Tool / stage | What it checks | Typical failure (blame) |
-|---|---|---|
-| compile: `harness` | `src/build/harness.py` rules: only `src/<name>.c`/`.h`, no libc headers, no `printf`/`malloc`/`free`/`sprintf`, no startup symbols, `int main(void)` present | `#include <stdio.h>` (code) |
-| compile: `build` | `src/build/build.py`: arm-none-eabi-gcc + objcopy | syntax error (code); toolchain missing (rig) |
-| `test_firmware` | `src/build/qemu_gate.py`: boots the build with `qemu-system-arm -M raspi0`; the program must print `HIL:DONE` | hang, crash before `main`, `hil_panic` (code); QEMU missing (rig) |
-
-The harness reads its usual `=== FILE src/<name> ===` text, so the project's `src/`
-files are packed into that format and checked in a temporary folder; the agent's
-project folder is never modified by the harness.
-
-test_firmware works like flash_firmware: it only accepts the exact `artifact_id`
-from the latest successful compile_firmware in this task, and rejects anything
-else without running QEMU. It runs in its own subfolder of the project:
-
-```
-build-demo/
-  src/main.c            the agent's code
-  kernel.elf, kernel.bin, build.log    from compile_firmware
-  test_firmware/
-    kernel.elf          copy of the build that was tested
-    qemu.log            QEMU console output (HIL:BOOT ... HIL:DONE)
-```
-
-The result includes the console output (`console`) and the folder (`test_dir`).
 
 For example, have the agent write `build-demo/src/main.c`, then call
 `compile_firmware(project_dir="build-demo")`. The directory must be inside the
@@ -142,18 +103,16 @@ support copies. Generated firmware should not edit them. Use freestanding C with
 use `hil_puts`. Then the existing `build.run(project)` compiles and links the code
 and produces `kernel.elf`, `kernel.bin`, and `build.log` in that project.
 
-The blocking harness, build, and QEMU steps run in a worker thread so terminal heartbeats and other HTTP
-requests can continue. A successful compile returns an artifact ID and the existing
-build metadata: ELF/binary paths, byte length, and CRC32. The flash stub accepts the
-ID only after that same build passed test_firmware in this task. A new compile, or a
-failed test, clears it.
+The blocking build runs in a worker thread so terminal heartbeats and other HTTP
+requests can continue. Success returns an artifact ID and the existing build
+metadata: ELF/binary paths, byte length, and CRC32. The flash stub accepts the ID
+only from the latest successful build in this task. A failed rebuild clears it.
 
-Rule violations, compiler errors, and QEMU failures return `status: error`,
-`blame: code`, and feedback Gemini can use to edit the file and compile again.
-Missing tools/support files are setup failures (`blame: rig`); the agent should
-report them rather than rewrite firmware. QEMU does not model real timing, so
-passing it does not prove timing on hardware. Hardware execution and UART/FPGA
-collection are not called by this integration.
+Compiler errors return `status: error`, `blame: code`, and feedback Gemini can
+use to edit the file and compile again. Missing tools/support files are setup
+failures (`blame: rig`); the agent should report them rather than rewrite firmware.
+A successful compilation does not establish correct runtime behavior. QEMU,
+hardware execution, and UART/FPGA collection are not called by this integration.
 LocalEnvironment is a local development tool, not an OS sandbox.
 
 ## Long waits and test prompts
@@ -180,18 +139,17 @@ backend before retrying so the earlier run does not remain active.
 
 1. FastAPI validates TaskRequest: nonblank text, at most 10,000 characters.
 2. The endpoint checks GOOGLE_API_KEY and awaits run_agent_loop.
-3. That function defines compile_firmware, test_firmware, and flash_firmware, with build state
+3. That function defines compile_firmware and flash_firmware, with build state
    private to this request. ADK turns their names, docstrings, and type annotations
    into tool descriptions Gemini can use.
 4. ADK's EnvironmentToolset supplies three local file tools in the shared workspace.
-   An Agent gives Gemini instructions, those file tools, the real compile and
-   QEMU test tools, and the simulated flash tool. An InMemoryRunner creates
+   An Agent gives Gemini instructions, those file tools, the real compile tool,
+   and simulated flash tool. An InMemoryRunner creates
    a fresh session and manages model/tool/model turns. A session holds this run's
    conversation and tool results in RAM; no conversation is reused across tasks.
-5. For the example prompt, Gemini is instructed to compile, then test, then flash,
-   passing the exact returned artifact ID along. Python does not preselect these calls.
-   test_firmware rejects an unknown ID or a call before a build; the flash stub
-   rejects anything that has not passed test_firmware.
+5. For the example prompt, Gemini is instructed to compile first and then pass the
+   exact returned artifact ID to flash. Python does not preselect these calls.
+   The flash stub rejects an unknown ID or a call before a build.
 6. The runner executes requested tools and feeds results back to Gemini. Our event
    loop collects tool calls/results and the final answer, excluding thought parts.
 7. FastAPI returns JSON; the runner is closed and its session is not persisted.
@@ -202,8 +160,8 @@ means an answer was returned, not that real firmware was tested. Missing API key
 returns 503; invalid task input returns 422; an unsuccessful Gemini/ADK run returns
 502 without exposing provider internals.
 
-The compile and test tools reuse the harness, build, and QEMU stages directly; they
-do not call the unfinished runner. The flash stub only checks the artifact ID.
+The compile tool reuses the build stage directly; it does not call the unfinished
+harness or the rest of the pipeline. The flash stub only checks the artifact ID.
 No general shell tool, runtime firmware validation, hardware
 protocols, UART/FPGA retrieval, authentication, or dashboard integration is included.
 Orchestration owns agent decisions and limits; runner will own concrete hardware
@@ -216,13 +174,9 @@ python -m pip install -r src/orchestration/requirements-dev.txt
 python -m unittest src.orchestration.test_api
 ```
 
-Tests replace the model transport. Most mock the harness rules, build stage, and
-QEMU gate (passing by default) to test ADK plumbing; integration tests use the
-installed ARM compiler (and QEMU for one end-to-end test) and are skipped if absent.
-They verify harness rejection before gcc runs, test_firmware running QEMU in the
-project's test_firmware/ folder and rejecting unknown IDs, flashing only after a
-passing test, QEMU failures blocking flashing,
-real binary creation and metadata, compiler-error feedback and repair,
+Tests replace the model transport. Most mock the build stage to test ADK plumbing;
+integration tests use the installed ARM compiler and are skipped if it is absent.
+They verify real binary creation and metadata, compiler-error feedback and repair,
 missing tools, invalidation after a failed rebuild, artifact handoff, fresh
 sessions, real file write/read/edit and persistence, workspace path rejection,
 shell-tool exclusion, thought filtering, request validation, and error responses. They do not
