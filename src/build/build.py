@@ -104,11 +104,14 @@ run(). Don't copy its value somewhere else when the file loads.
 """
 from __future__ import annotations
 
-from ast import main
 from pathlib import Path
 import subprocess
 import zlib
-from common import StageResult, tail
+# Support both package imports from orchestration and the existing local CLI/tests.
+if __package__:
+    from .common import StageResult, tail
+else:
+    from common import StageResult, tail
 
 CC = "arm-none-eabi-gcc"            # the cross-compiler
 OBJCOPY = "arm-none-eabi-objcopy"   # turns kernel.elf into kernel.bin
@@ -164,8 +167,11 @@ def run(attempt_dir: Path) -> StageResult:
                            feedback="The code did not compile:\n" + tail(gcc.stderr))
 
     # 3. Turn kernel.elf into the raw bytes we send to the Pi.
-    objcopy = subprocess.run([OBJCOPY, "-O", "binary", "kernel.elf", "kernel.bin"],
-                             cwd=attempt_dir, capture_output=True, text=True)
+    try:
+        objcopy = subprocess.run([OBJCOPY, "-O", "binary", "kernel.elf", "kernel.bin"],
+                                 cwd=attempt_dir, capture_output=True, text=True)
+    except FileNotFoundError:
+        return StageResult("build", False, f"{OBJCOPY} is not installed", blame="rig")
     if objcopy.returncode != 0:
         return StageResult("build", False, "objcopy failed", blame="rig")
 

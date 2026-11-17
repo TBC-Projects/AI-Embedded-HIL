@@ -3,6 +3,8 @@
 import asyncio
 import unittest
 import io
+import shutil
+import zlib
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,6 +18,8 @@ from google.genai import types
 from google.genai.errors import ClientError
 
 from src.orchestration.main import MODEL, TaskRequest, app, run_agent_loop
+from src.build import build as firmware_build
+from src.build.common import StageResult
 
 MODEL_METHOD = "google.adk.models.google_llm.Gemini.generate_content_async"
 
@@ -44,7 +48,7 @@ def fake_model(*, try_invalid_artifacts=False):
         else:
             yield LlmResponse(content=types.Content(role="model", parts=[
                 types.Part(text="Private reasoning must not appear in the API.", thought=True),
-                types.Part(text="Simulated compilation and flashing succeeded. No hardware was contacted."),
+                types.Part(text="Compilation succeeded and flashing was simulated. No hardware was contacted."),
             ]))
             return
         yield LlmResponse(content=types.Content(role="model", parts=[
@@ -67,12 +71,15 @@ def fake_file_model(operations):
         ]
         if len(results) == len(operations):
             yield LlmResponse(content=types.Content(role="model", parts=[
-                types.Part(text="File operations finished. Build and flash are simulated."),
+                types.Part(text="File operations finished. Flashing is simulated."),
             ]))
             return
         name, args = operations[len(results)]
         if name == "flash_firmware":
-            args = {"artifact_id": results[-1].response["artifact_id"]}
+            args = {"artifact_id": next(
+                result.response["artifact_id"] for result in reversed(results)
+                if result.name == "compile_firmware" and result.response["status"] == "success"
+            )}
         yield LlmResponse(content=types.Content(role="model", parts=[
             types.Part(function_call=types.FunctionCall(name=name, args=args)),
         ]))
@@ -91,6 +98,19 @@ class ApiTests(unittest.TestCase):
         root_patch = patch("src.orchestration.main.WORKSPACE_ROOT", self.workspace_root)
         root_patch.start()
         self.addCleanup(root_patch.stop)
+        self.real_build = firmware_build.run
+
+        def test_build(project):
+            # Most tests focus on ADK plumbing; real compiler tests follow below.
+            binary = project / "kernel.bin"
+            binary.write_bytes(b"test binary")
+            return StageResult("build", True, "test build succeeded", artifacts={
+                "bin": str(binary), "length": binary.stat().st_size,
+            })
+
+        build_patch = patch("src.orchestration.main.firmware_build.run", side_effect=test_build)
+        self.build_mock = build_patch.start()
+        self.addCleanup(build_patch.stop)
         self.client = TestClient(app)
         # A dummy value passes our configuration check. Network calls are mocked.
         self.environment = patch.dict("os.environ", {"GOOGLE_API_KEY": "offline-test-key"})
@@ -138,7 +158,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
         self.assertEqual([result["status"] for result in results], ["error", "success", "error", "success"])
-        self.assertTrue(all(result["simulated"] for result in results))
+        self.assertEqual([result["simulated"] for result in results], [True, False, True, True])
 
     def test_new_task_gets_fresh_session_and_build(self):
         with patch(MODEL_METHOD, fake_model()):
@@ -227,6 +247,95 @@ class ApiTests(unittest.TestCase):
         results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
         self.assertTrue(all(result["status"] == "error" for result in results))
         self.assertFalse(outside.exists())
+
+    @unittest.skipUnless(shutil.which(firmware_build.CC) and shutil.which(firmware_build.OBJCOPY), "ARM toolchain not installed")
+    def test_agent_writes_and_really_compiles_firmware(self):
+        self.build_mock.side_effect = self.real_build
+        operations = [
+            ("WriteFile", {"path": "demo/src/main.c", "content": 'int main(void) { return 0; }\n'}),
+            ("compile_firmware", {"project_dir": "demo"}),
+            ("flash_firmware", {}),
+        ]
+        with patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
+        build = results[1]
+        self.assertEqual(build["status"], "success", build)
+        self.assertFalse(build["simulated"])
+        project = self.workspace_root / "demo"
+        self.assertTrue((project / "kernel.elf").is_file())
+        self.assertTrue((project / "build.log").is_file())
+        binary = (project / "kernel.bin").read_bytes()
+        self.assertEqual(build["artifacts"]["length"], len(binary))
+        self.assertEqual(build["artifacts"]["crc32"], zlib.crc32(binary))
+        self.assertEqual(results[2]["artifact_id"], build["artifact_id"])
+        self.assertTrue(results[2]["simulated"])
+
+    @unittest.skipUnless(shutil.which(firmware_build.CC) and shutil.which(firmware_build.OBJCOPY), "ARM toolchain not installed")
+    def test_agent_receives_compiler_error_and_can_fix_it(self):
+        self.build_mock.side_effect = self.real_build
+        operations = [
+            ("WriteFile", {"path": "demo/src/main.c", "content": "int main(void) { return 0 }\n"}),
+            ("compile_firmware", {"project_dir": "demo"}),
+            ("EditFile", {"path": "demo/src/main.c", "old_string": "return 0", "new_string": "return 0;"}),
+            ("compile_firmware", {"project_dir": "demo"}),
+        ]
+        with patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        builds = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result" and event["name"] == "compile_firmware"]
+        self.assertEqual(builds[0]["status"], "error")
+        self.assertEqual(builds[0]["blame"], "code")
+        self.assertIn("src/main.c", builds[0]["feedback"])
+        self.assertIsNone(builds[0]["artifact_id"])
+        self.assertEqual(builds[1]["status"], "success", builds[1])
+
+    def test_compile_rejects_project_path_outside_workspace(self):
+        with patch(MODEL_METHOD, fake_file_model([("compile_firmware", {"project_dir": ".."})])):
+            response = self.submit()
+        result = response.json()["tool_events"][1]["result"]
+        self.assertEqual(result["status"], "error")
+        self.build_mock.assert_not_called()
+
+    def test_missing_compiler_returns_rig_failure(self):
+        self.build_mock.side_effect = self.real_build
+        operations = [
+            ("WriteFile", {"path": "src/main.c", "content": "int main(void) { return 0; }"}),
+            ("compile_firmware", {}),
+        ]
+        with patch.object(firmware_build, "CC", "missing-arm-compiler-for-test"), patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        result = response.json()["tool_events"][3]["result"]
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["blame"], "rig")
+        self.assertIsNone(result["artifact_id"])
+
+    @unittest.skipUnless(shutil.which(firmware_build.CC), "ARM compiler not installed")
+    def test_missing_objcopy_returns_rig_failure(self):
+        self.build_mock.side_effect = self.real_build
+        operations = [
+            ("WriteFile", {"path": "src/main.c", "content": "int main(void) { return 0; }"}),
+            ("compile_firmware", {}),
+        ]
+        with patch.object(firmware_build, "OBJCOPY", "missing-arm-objcopy-for-test"), patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()["tool_events"][3]["result"]
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["blame"], "rig")
+
+    def test_failed_rebuild_invalidates_previous_artifact(self):
+        self.build_mock.side_effect = [
+            StageResult("build", True, "built", artifacts={"bin": "kernel.bin"}),
+            StageResult("build", False, "compile failed", feedback="syntax error"),
+        ]
+        operations = [("compile_firmware", {}), ("compile_firmware", {}), ("flash_firmware", {})]
+        with patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
+        self.assertEqual([result["status"] for result in results], ["success", "error", "error"])
 
 
 class ProgressTests(unittest.IsolatedAsyncioTestCase):

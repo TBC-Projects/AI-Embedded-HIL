@@ -2,9 +2,9 @@
 
 One Google ADK Agent and InMemoryRunner handle each task. Gemini makes real API
 calls and can use ADK's built-in ReadFile, WriteFile, and EditFile tools to create
-real local source files. Compile and flash remain simulated Python tools: no
-compiler runs, no binary is created, and no Raspberry Pi is contacted. The
-dashboard still uses its separate browser-local mock workflow.
+real local source files. compile_firmware now calls src/build/build.py to produce
+real ARM binaries. Only flash_firmware remains simulated; no Raspberry Pi is
+contacted. The dashboard still uses its separate browser-local mock workflow.
 
 ## Run locally
 
@@ -30,14 +30,14 @@ In another terminal:
 curl http://127.0.0.1:8000/health
 curl -sS --max-time 90 http://127.0.0.1:8000/tasks \
   -H 'Content-Type: application/json' \
-  -d '{"task":"Call compile_firmware exactly once. If it succeeds, call flash_firmware exactly once using its returned artifact_id. After receiving the flash result, report both statuses in one sentence and finish. Do not call further tools."}' \
+  -d '{"task":"Write build-demo/src/main.c with int main(void) that returns 0. Call compile_firmware with project_dir build-demo. If the build succeeds, call flash_firmware once with the returned artifact_id. Report the real build result and simulated flash result, then finish."}' \
   | python3 -m json.tool
 ```
 
 The response contains `session_id`, `model`, `workspace`, `simulated`, `simulation_note`,
 `tool_events` (calls, arguments, and results), and `final_response`. Tool events and
 Gemini's final answer are also printed in the server terminal. `simulated: true`
-refers to the firmware operations; the model interaction is real. The server logs
+refers to flashing only; Gemini, file operations, and compilation are real. The server logs
 session setup, model requests/responses, tool execution, completion/failure, and
 cleanup with a run ID and elapsed seconds. Every 10 seconds a local heartbeat
 reports the current stage; it does not imply Google is making progress. Prompts
@@ -74,17 +74,50 @@ its three file tools and register them beside compile_firmware and flash_firmwar
 The shell Execute tool is not registered. Gemini supplies file paths and contents
 as structured tool arguments; no code-block extractor is used. File tool calls
 and results appear in the same transcript as compile/flash, including code content.
-`simulated: true` refers only to build/flash; file writes and reads are real.
+The compile result has `simulated: false`; the flash result has `simulated: true`.
+The top-level simulation note explains that only flashing remains simulated.
 
-The compile stub does not read or validate generated code. Its success does not
-prove a generated program compiles or behaves correctly. To try the whole flow,
-ask to write a C file, then compile it in simulation, flash the returned artifact
-ID in simulation, and finish with a short summary. Real compiler integration is
-still future work. LocalEnvironment is a local development tool, not an OS sandbox.
+## Real compilation
+
+Install both ARM tools if needed (no additional Python dependency is required):
+
+```sh
+# macOS
+brew install --cask gcc-arm-embedded
+# Ubuntu: sudo apt install gcc-arm-none-eabi
+arm-none-eabi-gcc --version
+arm-none-eabi-objcopy --version
+```
+
+For example, have the agent write `build-demo/src/main.c`, then call
+`compile_firmware(project_dir="build-demo")`. The directory must be inside the
+shared workspace. With no argument, the tool builds the workspace root and expects
+`src/*.c` there. The existing build stage compiles direct children of `src/`, not
+arbitrarily nested sources. A standalone file such as `uart-hello/main.c` must be
+placed under `uart-hello/src/main.c` before using that project layout.
+
+Before each build, orchestration copies the fixed `start.S`, `linker.ld`, `hil.c`,
+and `hil.h` files from `src/build/target/` into the project root, replacing those
+support copies. Generated firmware should not edit them. Use freestanding C with
+`int main(void)`; libc/stdio are unavailable. For UART output, include `hil.h` and
+use `hil_puts`. Then the existing `build.run(project)` compiles and links the code
+and produces `kernel.elf`, `kernel.bin`, and `build.log` in that project.
+
+The blocking build runs in a worker thread so terminal heartbeats and other HTTP
+requests can continue. Success returns an artifact ID and the existing build
+metadata: ELF/binary paths, byte length, and CRC32. The flash stub accepts the ID
+only from the latest successful build in this task. A failed rebuild clears it.
+
+Compiler errors return `status: error`, `blame: code`, and feedback Gemini can
+use to edit the file and compile again. Missing tools/support files are setup
+failures (`blame: rig`); the agent should report them rather than rewrite firmware.
+A successful compilation does not establish correct runtime behavior. QEMU,
+hardware execution, and UART/FPGA collection are not called by this integration.
+LocalEnvironment is a local development tool, not an OS sandbox.
 
 ## Long waits and test prompts
 
-During local testing, a compile-and-flash run completed both simulated tools but
+Before real compilation was integrated, a local run completed both simulated tools but
 then waited a long time for Gemini's final response. We stopped the run before
 completion, so this does not establish an infinite loop or a faulty flash tool.
 There is no overall backend timeout; the eight-model-call limit does not limit
@@ -110,8 +143,8 @@ backend before retrying so the earlier run does not remain active.
    private to this request. ADK turns their names, docstrings, and type annotations
    into tool descriptions Gemini can use.
 4. ADK's EnvironmentToolset supplies three local file tools in the shared workspace.
-   An Agent gives Gemini instructions, those file tools, and the two simulated
-   compile/flash functions. An InMemoryRunner creates
+   An Agent gives Gemini instructions, those file tools, the real compile tool,
+   and simulated flash tool. An InMemoryRunner creates
    a fresh session and manages model/tool/model turns. A session holds this run's
    conversation and tool results in RAM; no conversation is reused across tasks.
 5. For the example prompt, Gemini is instructed to compile first and then pass the
@@ -127,10 +160,9 @@ means an answer was returned, not that real firmware was tested. Missing API key
 returns 503; invalid task input returns 422; an unsuccessful Gemini/ADK run returns
 502 without exposing provider internals.
 
-Replace the two nested tool bodies in main.py with concrete runner operations
-later, preserving structured success/error results and the artifact handoff. The
-compile stub currently creates only an ID; the flash stub only checks that ID.
-No arbitrary shell execution, real firmware validation, hardware
+The compile tool reuses the build stage directly; it does not call the unfinished
+harness or the rest of the pipeline. The flash stub only checks the artifact ID.
+No general shell tool, runtime firmware validation, hardware
 protocols, UART/FPGA retrieval, authentication, or dashboard integration is included.
 Orchestration owns agent decisions and limits; runner will own concrete hardware
 operations. Its unresolved interfaces are documented in src/runner/README.md.
@@ -142,8 +174,10 @@ python -m pip install -r src/orchestration/requirements-dev.txt
 python -m unittest src.orchestration.test_api
 ```
 
-Tests replace only the model transport. They use the actual ADK runner to discover
-and execute the real stub functions, verify artifact handoff and rejection, fresh
+Tests replace the model transport. Most mock the build stage to test ADK plumbing;
+integration tests use the installed ARM compiler and are skipped if it is absent.
+They verify real binary creation and metadata, compiler-error feedback and repair,
+missing tools, invalidation after a failed rebuild, artifact handoff, fresh
 sessions, real file write/read/edit and persistence, workspace path rejection,
 shell-tool exclusion, thought filtering, request validation, and error responses. They do not
 verify Gemini connectivity, credentials, quota, or real model tool selection.

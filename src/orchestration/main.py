@@ -1,10 +1,11 @@
-"""One Gemini agent with real local file tools and simulated compile/flash tools."""
+"""One Gemini agent with local file tools, real ARM builds, and simulated flashing."""
 
 import asyncio
 from contextlib import suppress
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 from time import monotonic
 from uuid import uuid4
@@ -19,6 +20,8 @@ from google.genai import types
 from google.genai.errors import APIError
 from pydantic import BaseModel, Field, field_validator
 
+from src.build import build as firmware_build
+
 # This demo uses the Gemini API with GOOGLE_API_KEY, rather than Vertex AI.
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "FALSE"
 
@@ -28,6 +31,7 @@ MODEL = "gemini-3.8-flash"
 APP_NAME = "firmware_mvp"
 PROGRESS_INTERVAL_SECONDS = 10
 WORKSPACE_ROOT = Path(__file__).resolve().parent / "workspaces"
+BUILD_SUPPORT_DIR = Path(firmware_build.__file__).resolve().parent / "target"
 
 
 class TaskRequest(BaseModel):
@@ -75,7 +79,7 @@ async def submit_task(request: TaskRequest) -> dict:
             status_code=502,
             detail="Gemini/ADK did not complete the run. Check the API key, model access, "
             "quota, and network connection. See the backend terminal for Google's "
-            "redacted error details. Compile/flash tools are simulated only.",
+            "redacted error details. Builds are real; only flashing is simulated.",
         ) from error
 
 
@@ -107,7 +111,7 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             # This is a local heartbeat, not evidence of progress inside Google.
             log(f"Still active; current stage: {phase}. This is a local waiting update.")
 
-    log("Task accepted. Creating agent and runner; compile/flash are SIMULATED.")
+    log("Task accepted. Creating agent and runner; compilation is REAL, flashing is SIMULATED.")
     # An explicit directory keeps generated files after ADK closes the environment.
     # Every task shares this directory so later requests can revise existing files.
     # Session IDs still identify conversations, but are not used as folder names.
@@ -122,23 +126,60 @@ async def run_agent_loop(task: TaskRequest) -> dict:
         tool for tool in await file_toolset.get_tools()
         if tool.name in {"ReadFile", "WriteFile", "EditFile"}
     ]
-    # These ordinary Python functions are nested so each task owns its fake build.
-    # Replace their bodies with runner calls when real build/flash interfaces exist.
+    # Each task tracks its latest successful build for the simulated flash tool.
     built_artifact: str | None = None
 
-    def compile_firmware() -> dict:
-        """Simulate compiling prepared C firmware. Return a fake artifact ID on success.
+    async def compile_firmware(project_dir: str = ".") -> dict:
+        """Build a project's src/*.c files using the real ARM cross-compiler.
 
-        No code is read or compiled, and no build artifact is written.
+        Args:
+            project_dir: Project folder relative to the workspace, e.g. uart-hello.
+
+        Fixed startup/linker/HIL support files are copied into the project first.
+        Returns compiler feedback on failure, or artifact_id and binary metadata
+        on success. A successful build does not prove correct runtime behavior.
         """
-        nonlocal built_artifact
-        log("Executing compile_firmware locally (SIMULATED).")
-        built_artifact = f"simulated-firmware-{uuid4().hex}"
+        nonlocal built_artifact, phase
+        # A failed rebuild must not leave a previous artifact eligible for flashing.
+        built_artifact = None
+        project = (workspace / project_dir).resolve()
+        if not project.is_relative_to(workspace.resolve()):
+            return {"status": "error", "simulated": False, "blame": "code",
+                    "feedback": "project_dir must stay inside the workspace."}
+        if not project.is_dir():
+            return {"status": "error", "simulated": False, "blame": "code",
+                    "feedback": "Project directory does not exist. Write project/src/main.c first."}
+
+        log(f"Compiling {project} with {firmware_build.CC} (REAL).")
+        phase_before_build = phase
+        phase = f"compiling {project_dir} with {firmware_build.CC}"
+        # Keep blocking compiler processes off the asynchronous server event loop.
+        try:
+            for name in ("start.S", "linker.ld", "hil.c", "hil.h"):
+                destination = project / name
+                if destination.is_symlink():
+                    return {"status": "error", "simulated": False, "blame": "code",
+                            "feedback": f"Fixed support file {name} must not be a symlink."}
+                shutil.copyfile(BUILD_SUPPORT_DIR / name, destination)
+            result = await asyncio.to_thread(firmware_build.run, project)
+        except OSError as error:
+            log(f"Build setup failed ({type(error).__name__}).")
+            return {"status": "error", "simulated": False, "blame": "rig",
+                    "feedback": "Could not prepare or run the build. Check support files and toolchain installation."}
+        finally:
+            phase = phase_before_build
+
+        log(f"Build {'succeeded' if result.ok else 'failed'}: {result.summary}")
+        if result.ok:
+            built_artifact = f"firmware-{uuid4().hex}"
         return {
-            "status": "success",
-            "simulated": True,
+            "status": "success" if result.ok else "error",
+            "simulated": False,
             "artifact_id": built_artifact,
-            "message": "Simulated compilation succeeded. No compiler ran or binary was created.",
+            "summary": result.summary,
+            "feedback": result.feedback,
+            "blame": result.blame if not result.ok else None,
+            "artifacts": result.artifacts,
         }
 
     def flash_firmware(artifact_id: str) -> dict:
@@ -152,7 +193,7 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             return {
                 "status": "error",
                 "simulated": True,
-                "message": "Artifact mismatch or no build yet. Compile first and use its exact artifact_id. Nothing was flashed.",
+                "message": "Artifact mismatch or no successful build yet. Compile first and use its exact artifact_id. Nothing was flashed.",
             }
         return {
             "status": "success",
@@ -165,20 +206,29 @@ async def run_agent_loop(task: TaskRequest) -> dict:
         name="firmware_agent",
         model=MODEL,
         instruction=(
-            "You generate firmware files and demonstrate a simulated build/flash workflow. "
+            "You generate and compile bare-metal C firmware for Raspberry Pi Zero W. "
             f"Your local workspace is {workspace}. "
             "Files persist across tasks. Read existing files before revising them. "
             "Use WriteFile to save generated code, ReadFile to inspect it, and EditFile "
             "to revise it. Use paths relative to this workspace. File operations are REAL. "
             "When asked to write code, save it with WriteFile rather than only quoting "
             "it in your final answer. Report filenames and any tool errors honestly. "
-            "Compilation and flashing are SIMULATED: compile_firmware does not read "
-            "or validate your files and cannot establish whether the code works. "
+            "Compilation is REAL; only flashing is SIMULATED. "
+            "Save C source under a project's src/ directory, e.g. uart-hello/src/main.c. "
+            "Then call compile_firmware(project_dir='uart-hello'). For workspace-root "
+            "projects, write src/main.c and use project_dir='.'. The build compiles "
+            "src/*.c (not nested source directories). Define int main(void). "
+            "The build supplies fixed start.S, linker.ld, hil.c, and hil.h; do not edit "
+            "these support files. Use freestanding C, not libc/stdio. "
+            "For console output, include hil.h and call hil_puts. "
+            "If a build fails with blame='code', use its feedback to revise the source. "
+            "If blame='rig', report the setup problem and stop rather than rewriting code. "
             "For a compile-and-flash request, call compile_firmware first. "
             "Only if it succeeds, call flash_firmware with the exact artifact_id "
             "returned by compile_firmware; never invent an ID. "
-            "Use tool results to report what happened. Always explain that compilation "
-            "and flashing were simulated and no hardware was contacted. "
+            "Use tool results to report what happened. Explain that compilation was real, "
+            "flashing was simulated, and no hardware was contacted. A successful build "
+            "does not prove the firmware behaves correctly. "
             "You cannot execute shell commands, access hardware, or test real firmware."
         ),
         tools=[compile_firmware, flash_firmware, *file_tools],
@@ -230,7 +280,7 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             "model": MODEL,
             "workspace": str(workspace),
             "simulated": True,
-            "simulation_note": "Gemini and local file operations are real; compilation and flashing are fake. No hardware was contacted.",
+            "simulation_note": "Gemini, file operations, and compilation are real; flashing is simulated. No hardware was contacted.",
             "tool_events": tool_events,
             "final_response": final_response,
         }
