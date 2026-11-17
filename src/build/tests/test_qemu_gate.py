@@ -42,11 +42,35 @@ def test_panic_fails_with_console(tmp_path):
     assert "bad timer" in r.feedback
 
 
-def test_hang_times_out(tmp_path):
+def test_endless_loop_still_running_passes(tmp_path):
+    # Real firmware never returns from main. Booting and running without a
+    # panic until the time limit counts as a pass.
     r = qemu_gate.run(elf(tmp_path, "hang"), timeout_s=1.5)
+    assert r.ok, r.feedback
+    assert "still running" in r.summary
+    assert "stuck" in r.artifacts["console"]
+
+
+def test_firmware_loop_with_expect_passes_as_soon_as_text_appears(tmp_path):
+    program = elf(tmp_path, "firmware_loop")
+    started = time.monotonic()
+    r = qemu_gate.run(program, timeout_s=10, expect="UART ready")
+    assert r.ok, r.feedback
+    assert "printed 'UART ready'" in r.summary
+    assert time.monotonic() - started < 3   # didn't wait for the 10 s limit
+
+
+def test_firmware_loop_keeps_printing(tmp_path):
+    r = qemu_gate.run(elf(tmp_path, "firmware_loop"), timeout_s=10, expect="tick")
+    assert r.ok, r.feedback
+
+
+def test_expected_text_missing_fails(tmp_path):
+    r = qemu_gate.run(elf(tmp_path, "hang"), timeout_s=1.5, expect="UART ready")
     assert not r.ok
-    assert "no HIL:DONE" in r.summary
-    assert "stuck" in r.feedback
+    assert r.blame == "code"
+    assert "did not print 'UART ready'" in r.summary
+    assert "stuck" in r.feedback          # the AI still sees what was printed
 
 
 def test_never_boots(tmp_path):

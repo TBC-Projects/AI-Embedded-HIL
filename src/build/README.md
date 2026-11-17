@@ -69,7 +69,7 @@ Each attempt is written to `jobs/demo/attempt-1/`, which git ignores: the LLM's 
 | Marker | Printed when |
 |---|---|
 | `HIL:BOOT` | before `main()` runs |
-| `HIL:DONE` | after `main()` returns (then the Pi reboots into the bootloader) |
+| `HIL:DONE` | after `main()` returns (then the Pi reboots into the bootloader). Real firmware loops forever and never prints this; the QEMU gate passes a program that boots and keeps running without a panic, or that prints an expected text |
 | `HIL:PANIC <reason>` | the program called `hil_panic("reason")` |
 
 ## Serial protocols (proposed: the firmware must match)

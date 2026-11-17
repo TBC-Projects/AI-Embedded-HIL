@@ -19,12 +19,19 @@ from google.adk.runners import InMemoryRunner
 from google.adk.tools.environment import EnvironmentToolset
 from google.genai import types
 from google.genai.errors import APIError
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 
 from src.build import build as firmware_build
 from src.build import harness as firmware_harness
 from src.build import qemu_gate as firmware_qemu
 from src.build.common import StageResult
+
+# Read settings such as GOOGLE_API_KEY from a local .env file at the repo root.
+# .env is git-ignored, so the key stays on this computer. A value already set in
+# the terminal (export GOOGLE_API_KEY=...) takes priority over the file.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(REPO_ROOT / ".env")
 
 # This demo uses the Gemini API with GOOGLE_API_KEY, rather than Vertex AI.
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "FALSE"
@@ -216,16 +223,21 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             "artifacts": result.artifacts,
         }
 
-    async def test_firmware(artifact_id: str) -> dict:
+    async def test_firmware(artifact_id: str, expect_output: str = "") -> dict:
         """Run the compiled firmware on an emulated Raspberry Pi Zero (QEMU). This is REAL.
 
         Args:
             artifact_id: Exact artifact_id from the latest successful compile result.
+            expect_output: Optional text the firmware must print on its console,
+                e.g. "UART ready". Leave empty to only check that it runs.
 
-        Copies kernel.elf into the project's test_firmware/ subfolder, boots it there,
-        and saves the console output as test_firmware/qemu.log. Passes only if the
-        program prints HIL:DONE (main returned). Fails on a hang, a crash before main,
-        or hil_panic. QEMU has no real timing, so passing does not prove timing on hardware.
+        Copies kernel.elf into the project's test_firmware/ subfolder, runs it there
+        for a few seconds, and saves the console output as test_firmware/qemu.log.
+        Firmware may loop forever and never return from main; that is normal.
+        Passes if it boots and keeps running without hil_panic (and, if given,
+        prints expect_output). Fails on hil_panic, a crash before main, QEMU
+        exiting, or missing expect_output. QEMU has no real timing, so passing
+        does not prove timing on hardware.
         """
         nonlocal tested_artifact, phase
         tested_artifact = None
@@ -248,7 +260,10 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             test_dir.mkdir(exist_ok=True)
             shutil.copyfile(built_project / "kernel.elf", test_dir / "kernel.elf")
             # Keep the blocking QEMU process off the asynchronous server event loop.
-            result = await asyncio.to_thread(firmware_qemu.run, test_dir / "kernel.elf")
+            result = await asyncio.to_thread(
+                firmware_qemu.run, test_dir / "kernel.elf",
+                expect=expect_output.strip() or None,
+            )
             console = result.artifacts.get("console", "")
             (test_dir / "qemu.log").write_text(console)
         except OSError as error:
@@ -311,8 +326,12 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             "printf, malloc, free, sprintf; never use _start, __stack_top or "
             "__bss_start) and 'build' (gcc errors). "
             "test_firmware boots the build on an emulated Pi Zero in the project's "
-            "test_firmware/ folder. The program must return from main so HIL:DONE is "
-            "printed; a hang, a crash before main, or hil_panic fails. Its console "
+            "test_firmware/ folder and runs it for a few seconds. Firmware normally "
+            "loops forever and never returns from main; that is expected and passes "
+            "as long as it boots and does not call hil_panic. To check behaviour, have "
+            "the firmware print a status line with hil_puts (e.g. 'UART ready') and pass "
+            "that text as expect_output; the test then fails if it is never printed. "
+            "A hil_panic, a crash before main, or QEMU exiting fails. Its console "
             "output is in the result. "
             "Save C source under a project's src/ directory, e.g. uart-hello/src/main.c. "
             "Then call compile_firmware(project_dir='uart-hello'). For workspace-root "
