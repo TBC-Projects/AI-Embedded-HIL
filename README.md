@@ -43,8 +43,10 @@ This report serves two primary functions:
 ## Local MVP
 
 The current implementation is a browser-local demonstration plus an independent
-FastAPI endpoint using Google ADK and Gemini with simulated compile/flash tools.
-The backend calls a real model, but does not compile firmware, upload binaries, or
+FastAPI endpoint using Google ADK and Gemini with local file tools and simulated
+compile/flash tools. The agent can save and revise real source files in the shared
+`src/orchestration/workspaces/` directory across requests. Each conversation starts
+fresh. The backend calls a real model, but does not compile firmware, upload binaries, or
 access hardware. No authentication, database, or deployment is included.
 
 Frontend (Node.js 22.14+):
@@ -71,7 +73,8 @@ python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 80
 ```
 
 `GET /health` returns 200. `POST /tasks` sends the prompt to a Gemini agent with
-simulated compile/flash tools and returns the answer and tool transcript. See the
+local file tools and simulated compile/flash tools. It returns the workspace path,
+answer, and tool transcript. See the [file generation example](src/orchestration/README.md#generate-a-real-local-file) and
 [test prompts and long-wait notes](src/orchestration/README.md#long-waits-and-test-prompts)
 before testing: some runs have waited a long time for a final model response, and
 there is no overall backend timeout. The frontend remains independent and does

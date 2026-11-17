@@ -1,17 +1,20 @@
-"""One Gemini agent with simulated compile/flash tools; no hardware access."""
+"""One Gemini agent with real local file tools and simulated compile/flash tools."""
 
 import asyncio
 from contextlib import suppress
 import json
 import os
 import re
+from pathlib import Path
 from time import monotonic
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from google.adk.agents import Agent
 from google.adk.agents.run_config import RunConfig
+from google.adk.environment import LocalEnvironment
 from google.adk.runners import InMemoryRunner
+from google.adk.tools.environment import EnvironmentToolset
 from google.genai import types
 from google.genai.errors import APIError
 from pydantic import BaseModel, Field, field_validator
@@ -24,6 +27,7 @@ app = FastAPI(title="Embedded AI HIL orchestration", version="0.1.0")
 MODEL = "gemini-3.8-flash"
 APP_NAME = "firmware_mvp"
 PROGRESS_INTERVAL_SECONDS = 10
+WORKSPACE_ROOT = Path(__file__).resolve().parent / "workspaces"
 
 
 class TaskRequest(BaseModel):
@@ -104,6 +108,20 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             log(f"Still active; current stage: {phase}. This is a local waiting update.")
 
     log("Task accepted. Creating agent and runner; compile/flash are SIMULATED.")
+    # An explicit directory keeps generated files after ADK closes the environment.
+    # Every task shares this directory so later requests can revise existing files.
+    # Session IDs still identify conversations, but are not used as folder names.
+    workspace = WORKSPACE_ROOT
+    workspace.mkdir(parents=True, exist_ok=True)
+    log(f"Local file workspace: {workspace}. File writes are REAL.")
+    file_toolset = EnvironmentToolset(
+        environment=LocalEnvironment(working_dir=workspace),
+    )
+    # Select ADK's ready-made file tools. Do not expose its Execute shell tool.
+    file_tools = [
+        tool for tool in await file_toolset.get_tools()
+        if tool.name in {"ReadFile", "WriteFile", "EditFile"}
+    ]
     # These ordinary Python functions are nested so each task owns its fake build.
     # Replace their bodies with runner calls when real build/flash interfaces exist.
     built_artifact: str | None = None
@@ -147,15 +165,23 @@ async def run_agent_loop(task: TaskRequest) -> dict:
         name="firmware_agent",
         model=MODEL,
         instruction=(
-            "You demonstrate a firmware workflow with two SIMULATED tools. "
+            "You generate firmware files and demonstrate a simulated build/flash workflow. "
+            f"Your local workspace is {workspace}. "
+            "Files persist across tasks. Read existing files before revising them. "
+            "Use WriteFile to save generated code, ReadFile to inspect it, and EditFile "
+            "to revise it. Use paths relative to this workspace. File operations are REAL. "
+            "When asked to write code, save it with WriteFile rather than only quoting "
+            "it in your final answer. Report filenames and any tool errors honestly. "
+            "Compilation and flashing are SIMULATED: compile_firmware does not read "
+            "or validate your files and cannot establish whether the code works. "
             "For a compile-and-flash request, call compile_firmware first. "
             "Only if it succeeds, call flash_firmware with the exact artifact_id "
             "returned by compile_firmware; never invent an ID. "
             "Use tool results to report what happened. Always explain that compilation "
             "and flashing were simulated and no hardware was contacted. "
-            "You cannot edit code, execute shell commands, or test real firmware."
+            "You cannot execute shell commands, access hardware, or test real firmware."
         ),
-        tools=[compile_firmware, flash_firmware],
+        tools=[compile_firmware, flash_firmware, *file_tools],
         before_model_callback=before_model,
         after_model_callback=after_model,
     )
@@ -202,8 +228,9 @@ async def run_agent_loop(task: TaskRequest) -> dict:
         return {
             "session_id": session.id,
             "model": MODEL,
+            "workspace": str(workspace),
             "simulated": True,
-            "simulation_note": "Gemini is real; compilation and flashing are fake. No hardware was contacted.",
+            "simulation_note": "Gemini and local file operations are real; compilation and flashing are fake. No hardware was contacted.",
             "tool_events": tool_events,
             "final_response": final_response,
         }
@@ -219,5 +246,10 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             await heartbeat
         # The session exists only in this runner's RAM and is not persisted.
         log("Closing runner and releasing in-memory resources.")
-        await runner.close()
-        log("Runner closed; waiting updates stopped.")
+        try:
+            await runner.close()
+        finally:
+            # We passed individual tools to Agent, so close their toolset ourselves.
+            # LocalEnvironment preserves an explicitly supplied workspace directory.
+            await file_toolset.close()
+        log("Runner closed; waiting updates stopped. Workspace files are preserved.")

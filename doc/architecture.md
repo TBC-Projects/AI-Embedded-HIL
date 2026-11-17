@@ -7,7 +7,10 @@ mock workflow. It plays fixed sample agent actions, build output, UART feedback,
 and a failed-test/revision/passing-test sequence. It does not execute the submitted
 task. FastAPI exposes health and a task endpoint using one Google ADK Agent with
 Gemini and an InMemoryRunner. Each task creates a fresh session; ordinary Python
-compile/flash tools return explicitly simulated results. The backend calls Gemini,
+compile/flash tools return explicitly simulated results. Built-in ADK file tools
+can write, read, and edit real source files in one shared persistent workspace
+(`src/orchestration/workspaces/`). Conversation sessions remain separate per request.
+The backend calls Gemini,
 but no real compilation or hardware access takes place. There is no hardware runner
 service or dashboard/backend connection. See the component READMEs for setup.
 

@@ -4,6 +4,8 @@ import asyncio
 import unittest
 import io
 from contextlib import redirect_stdout
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -51,12 +53,44 @@ def fake_model(*, try_invalid_artifacts=False):
     return generate
 
 
+def fake_file_model(operations):
+    """Request real ADK file operations without contacting Gemini."""
+    async def generate(model, llm_request, stream=False):
+        assert set(llm_request.tools_dict) == {
+            "ReadFile", "WriteFile", "EditFile", "compile_firmware", "flash_firmware",
+        }  # In particular, shell execution must not be offered to the model.
+        results = [
+            part.function_response
+            for content in llm_request.contents
+            for part in content.parts or []
+            if part.function_response
+        ]
+        if len(results) == len(operations):
+            yield LlmResponse(content=types.Content(role="model", parts=[
+                types.Part(text="File operations finished. Build and flash are simulated."),
+            ]))
+            return
+        name, args = operations[len(results)]
+        if name == "flash_firmware":
+            args = {"artifact_id": results[-1].response["artifact_id"]}
+        yield LlmResponse(content=types.Content(role="model", parts=[
+            types.Part(function_call=types.FunctionCall(name=name, args=args)),
+        ]))
+    return generate
+
+
 class ApiTests(unittest.TestCase):
     def test_configured_model_resolves_to_direct_gemini(self):
         # Resolve without a network call; a models/ prefix breaks ADK routing.
         self.assertIsInstance(LLMRegistry.new_llm(MODEL), Gemini)
 
     def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.workspace_root = Path(temporary.name) / "workspace"
+        root_patch = patch("src.orchestration.main.WORKSPACE_ROOT", self.workspace_root)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
         self.client = TestClient(app)
         # A dummy value passes our configuration check. Network calls are mocked.
         self.environment = patch.dict("os.environ", {"GOOGLE_API_KEY": "offline-test-key"})
@@ -110,6 +144,7 @@ class ApiTests(unittest.TestCase):
         with patch(MODEL_METHOD, fake_model()):
             first, second = self.submit().json(), self.submit().json()
         self.assertNotEqual(first["session_id"], second["session_id"])
+        self.assertEqual(first["workspace"], second["workspace"])
         self.assertNotEqual(first["tool_events"][1]["result"]["artifact_id"], second["tool_events"][1]["result"]["artifact_id"])
 
     def test_provider_error_is_not_reported_as_success(self):
@@ -140,8 +175,68 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("offline-test-key", output.getvalue())
         self.assertNotIn("offline-test-key", response.text)
 
+    def test_real_files_persist_after_write_read_edit_and_simulated_build(self):
+        operations = [
+            ("WriteFile", {"path": "firmware/main.c", "content": "int main(void) { return 0; }\n"}),
+            ("ReadFile", {"path": "firmware/main.c"}),
+            ("EditFile", {"path": "firmware/main.c", "old_string": "return 0", "new_string": "return 1"}),
+            ("ReadFile", {"path": "firmware/main.c"}),
+            ("compile_firmware", {}),
+            ("flash_firmware", {}),
+        ]
+        with patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        workspace = Path(data["workspace"])
+        self.assertEqual(workspace, self.workspace_root)
+        self.assertEqual((workspace / "firmware/main.c").read_text(), "int main(void) { return 1; }\n")
+        results = [event["result"] for event in data["tool_events"] if event["type"] == "tool_result"]
+        self.assertEqual([result["status"] for result in results], ["ok", "ok", "ok", "ok", "success", "success"])
+        self.assertIn("return 0", results[1]["content"])
+        self.assertIn("return 1", results[3]["content"])
+
+    def test_later_request_can_read_and_edit_existing_file(self):
+        with patch(MODEL_METHOD, fake_file_model([
+            ("WriteFile", {"path": "uart-hello/main.c", "content": "int main(void) { return 0; }\n"}),
+        ])):
+            first = self.submit()
+        self.assertEqual(first.status_code, 200, first.text)
+        with patch(MODEL_METHOD, fake_file_model([
+            ("ReadFile", {"path": "uart-hello/main.c"}),
+            ("EditFile", {"path": "uart-hello/main.c", "old_string": "return 0", "new_string": "return 1"}),
+        ])):
+            second = self.submit()
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertNotEqual(first.json()["session_id"], second.json()["session_id"])
+        self.assertEqual(first.json()["workspace"], second.json()["workspace"])
+        results = [event["result"] for event in second.json()["tool_events"] if event["type"] == "tool_result"]
+        self.assertIn("return 0", results[0]["content"])
+        self.assertEqual(results[1]["status"], "ok")
+        self.assertIn("return 1", (self.workspace_root / "uart-hello/main.c").read_text())
+
+    def test_file_tools_reject_paths_outside_shared_workspace(self):
+        outside = self.workspace_root.parent / "outside.c"
+        operations = [
+            ("WriteFile", {"path": "../outside.c", "content": "must not be saved"}),
+            ("WriteFile", {"path": str(outside), "content": "must not be saved"}),
+        ]
+        with patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
+        self.assertTrue(all(result["status"] == "error" for result in results))
+        self.assertFalse(outside.exists())
+
 
 class ProgressTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root_patch = patch("src.orchestration.main.WORKSPACE_ROOT", Path(temporary.name))
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+
     async def test_waiting_logs_model_turns_and_cleans_up(self):
         transport = fake_model()
 
