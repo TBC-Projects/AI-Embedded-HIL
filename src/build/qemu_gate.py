@@ -91,15 +91,79 @@ see HIL:DONE, not wait for the timeout.
 """
 from __future__ import annotations
 
+import selectors
+import subprocess
+import time
 from pathlib import Path
+from common import StageResult, tail
 
-from common import StageResult
-
+# the emulator program; "-M raspi0" (below) makes it pretend to be a Raspberry Pi Zero
 QEMU = "qemu-system-arm"
+# we can change this if we want to test a hang but we don't want to wait too
+# long for the test to finish, so we can make it smaller if we want
 TIMEOUT_S = 5.0
 
 
 def run(elf: Path, timeout_s: float = TIMEOUT_S) -> StageResult:
     """Boot elf on an emulated Pi Zero and check that it prints HIL:DONE."""
-    # TODO
-    raise NotImplementedError("TODO: write the QEMU gate")
+
+    # 1. Start QEMU as a separate process, pretending to be a Pi Zero.
+    #    "-serial stdio" sends the Pi's console text to QEMU's stdout, so we can read it.
+    # cmd looks like this:
+    #   qemu-system-arm -M raspi0 -kernel kernel.elf -display none -serial stdio -monitor none
+    cmd = [QEMU, "-M", "raspi0", "-kernel", str(elf),
+           "-display", "none", "-serial", "stdio", "-monitor", "none"]
+    # create pipes from that subprocess so that we can read the output from
+    # from over here
+    try:
+        qemu = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        # QEMU isn't installed
+        return StageResult("qemu", False, f"{QEMU} is not installed", blame="rig")
+
+    # 2. Read what the program prints until it finishes, QEMU quits, or time runs out.
+    output = b""
+    qemu_quit = False
+    try:
+        watcher = selectors.DefaultSelector()
+        watcher.register(qemu.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout_s
+
+        while time.monotonic() < deadline:
+            # check what is printed 
+            if watcher.select(timeout=0.1):
+                output = output + qemu.stdout.read1(4096)
+
+            text = output.decode(errors="replace")
+            # check if the prog printed any of the special markers
+            if "HIL:DONE" in text or "HIL:PANIC" in text:
+                break
+            # if the prog printed nothing then check if qemu has quit
+            if qemu.poll() is not None:
+                qemu_quit = True
+                break
+    finally:
+        qemu.kill()
+        qemu.wait()
+
+    console = output.decode(errors="replace").replace("\r", "")
+
+    # 4. Decide the result from what the program printed.
+    # success and go to the next stage
+    if "HIL:DONE" in console:
+            return StageResult("qemu", True, "booted and finished", artifacts={"console": console})
+    # all possible failure cases that goes back to the AI to fix the code
+    elif "HIL:PANIC" in console:
+        reason = "the program called hil_panic"
+    elif qemu_quit:
+        reason = "QEMU exited unexpectedly"
+    elif "HIL:BOOT" not in console:
+        reason = "the program never reached main (no HIL:BOOT)"
+    else:
+        reason = f"no HIL:DONE after {timeout_s:g}s (hang or infinite loop)"
+
+    # The AI gets the reason plus the last 50 lines the program printed.
+    # we can make this smaller if we have a smaller context window, but we want to give 
+    # the LLM enough info to debug
+    feedback = f"QEMU test failed: {reason}.\nConsole output:\n{tail(console, 50)}"
+    return StageResult("qemu", False, reason, feedback=feedback, artifacts={"console": console})
