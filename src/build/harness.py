@@ -113,6 +113,8 @@ The tests check:
 """
 from __future__ import annotations
 
+import re
+import shutil
 from pathlib import Path
 
 from common import StageResult
@@ -120,15 +122,107 @@ from common import StageResult
 # The folder holding the 4 files that get copied into every attempt.
 TARGET_DIR = Path(__file__).resolve().parent / "target"
 FIXED_FILES = ("start.S", "linker.ld", "hil.c", "hil.h")
+MAX_SOURCE_CHARS = 200_000
+
+FILE_HEADER = re.compile(r"^=== FILE (\S+) ===\s*$", re.MULTILINE)
+ALLOWED_PATH = re.compile(r"^src/[A-Za-z0-9_-]+\.(?:c|h)$")
+MAIN_FUNCTION = re.compile(r"\bint\s+main\s*\(\s*(?:void\s*)?\)")
+
+FORBIDDEN = [
+    (
+        re.compile(r"#\s*include\s*<(?:stdio|stdlib|string|malloc|unistd)\.h>"),
+        "no C standard library is available; use hil.h helpers instead",
+    ),
+    (
+        re.compile(r"\b(?:printf|malloc|free|sprintf)\s*\("),
+        "printf/malloc do not exist on bare metal; use hil_puts/hil_puthex",
+    ),
+    (
+        re.compile(r"\b(?:_start|__stack_top|__bss_start)\b"),
+        "do not touch startup symbols; start.S owns them",
+    ),
+]
 
 
 def parse_reply(reply: str) -> dict[str, str]:
     """Split the AI's reply into {file path: file contents}."""
-    # TODO
-    raise NotImplementedError("TODO: write parse_reply")
+    headers = list(FILE_HEADER.finditer(reply))
+    files: dict[str, str] = {}
+
+    for index, header in enumerate(headers):
+        body_start = header.end()
+        body_end = headers[index + 1].start() if index + 1 < len(headers) else len(reply)
+        body = reply[body_start:body_end].strip("\n")
+
+        # Remove optional Markdown fences, such as ```c ... ```.
+        body = re.sub(r"^```[A-Za-z0-9_+-]*\s*\n", "", body)
+        body = re.sub(r"\n```\s*$", "", body)
+        files[header.group(1)] = body.strip("\n") + "\n"
+
+    return files
 
 
 def run(reply: str, attempt_dir: Path) -> StageResult:
     """Check the AI's reply. Reject it, or save its files into attempt_dir."""
-    # TODO
-    raise NotImplementedError("TODO: write the harness")
+    files = parse_reply(reply)
+
+    def reject(reason: str) -> StageResult:
+        return StageResult(
+            "harness",
+            False,
+            f"rejected: {reason}",
+            feedback=f"Your reply was rejected before compiling: {reason}",
+        )
+
+    if not files:
+        return reject("no '=== FILE src/<name>.c ===' blocks found")
+
+    bad_paths = [path for path in files if not ALLOWED_PATH.fullmatch(path)]
+    if bad_paths:
+        return reject("files outside src/ are not allowed: " + ", ".join(bad_paths))
+
+    if sum(len(contents) for contents in files.values()) > MAX_SOURCE_CHARS:
+        return reject("source is too large")
+
+    all_code = "\n".join(files.values())
+    for pattern, reason in FORBIDDEN:
+        match = pattern.search(all_code)
+        if match:
+            return reject(f"'{match.group(0)}' is not allowed: {reason}")
+
+    if not MAIN_FUNCTION.search(all_code):
+        return reject("missing 'int main(void)' or 'int main()'")
+
+    missing_fixed_files = [
+        name for name in FIXED_FILES if not (TARGET_DIR / name).is_file()
+    ]
+    if missing_fixed_files:
+        reason = "missing target support files: " + ", ".join(missing_fixed_files)
+        return StageResult(
+            "harness",
+            False,
+            reason,
+            feedback=reason,
+            blame="rig",
+        )
+
+    if attempt_dir.exists():
+        shutil.rmtree(attempt_dir)
+
+    (attempt_dir / "src").mkdir(parents=True)
+    for path, contents in files.items():
+        destination = attempt_dir / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(contents)
+
+    for name in FIXED_FILES:
+        shutil.copy(TARGET_DIR / name, attempt_dir / name)
+
+    (attempt_dir / "reply.txt").write_text(reply)
+
+    return StageResult(
+        "harness",
+        True,
+        f"accepted {len(files)} file(s)",
+        artifacts={"files": sorted(files)},
+    )
