@@ -72,6 +72,16 @@ simultaneous edits to the shared files. Files are not automatically cleared.
 
 In main.py, EnvironmentToolset supplies existing ADK implementations. We select
 its three file tools and register them beside compile_firmware, run_qemu, and flash_firmware.
+An additional ordinary Python tool, `list_directory(path=".")`, discovers existing
+projects in the shared workspace. It returns names, types, and workspace-relative
+paths for one directory level. The agent can then list subdirectories and use
+ReadFile on the returned paths. It rejects paths outside the workspace, including
+links resolving outside it. Results are sorted and capped at 200 entries, with a
+`truncated` flag; it reads no file contents and runs no shell commands.
+
+Try in the dashboard: “List the workspace, explore the source folders, and explain
+what the existing firmware does. Do not change, compile, or run anything.”
+
 The shell Execute tool is not registered. Gemini supplies file paths and contents
 as structured tool arguments; no code-block extractor is used. File tool calls
 and results appear in the same transcript as compile/flash, including code content.

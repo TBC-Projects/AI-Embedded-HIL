@@ -205,6 +205,37 @@ async def run_agent_loop(task: TaskRequest, emit=None, run_id=None) -> dict:
         tool for tool in await file_toolset.get_tools()
         if tool.name in {"ReadFile", "WriteFile", "EditFile"}
     ]
+
+    def list_directory(path: str = ".") -> dict:
+        """List files and folders inside the shared workspace without reading contents.
+
+        Args:
+            path: Directory relative to the workspace. Use '.' to discover projects,
+                then list a returned directory path to explore inside it.
+
+        Lists one level at a time, up to 200 entries. Does not execute a shell.
+        """
+        try:
+            root = workspace.resolve()
+            directory = (root / path).resolve()
+            if not directory.is_relative_to(root):
+                return {"status": "error", "message": "Path must stay inside the workspace."}
+            if not directory.is_dir():
+                return {"status": "error", "message": "Directory does not exist or the path is a file."}
+            children = sorted(directory.iterdir(), key=lambda entry: entry.name)
+            entries = []
+            for child in children[:200]:
+                # Report links as links without inspecting their targets.
+                kind = "symlink" if child.is_symlink() else (
+                    "directory" if child.is_dir() else "file" if child.is_file() else "other"
+                )
+                entries.append({"name": child.name, "path": child.relative_to(root).as_posix(),
+                                "type": kind})
+            return {"status": "success", "path": directory.relative_to(root).as_posix(),
+                    "entries": entries, "truncated": len(children) > 200}
+        except (OSError, RuntimeError):
+            return {"status": "error", "message": "Could not list the directory. Check its path and permissions."}
+
     # Each task tracks its latest successful build for the simulated flash tool.
     built_artifact: str | None = None
     built_elf: Path | None = None
@@ -322,6 +353,9 @@ async def run_agent_loop(task: TaskRequest, emit=None, run_id=None) -> dict:
             "You generate and compile bare-metal C firmware for Raspberry Pi Zero W. "
             f"Your local workspace is {workspace}. "
             "Files persist across tasks. Read existing files before revising them. "
+            "Use list_directory('.') to discover existing projects, then list their "
+            "subdirectories and read relevant source files. Directory listings are "
+            "one level at a time; returned paths are relative to the workspace. "
             "Use WriteFile to save generated code, ReadFile to inspect it, and EditFile "
             "to revise it. Use paths relative to this workspace. File operations are REAL. "
             "When asked to write code, save it with WriteFile rather than only quoting "
@@ -353,7 +387,7 @@ async def run_agent_loop(task: TaskRequest, emit=None, run_id=None) -> dict:
             "does not prove the firmware behaves correctly. "
             "You cannot execute arbitrary shell commands or access physical hardware."
         ),
-        tools=[compile_firmware, run_qemu, flash_firmware, *file_tools],
+        tools=[list_directory, compile_firmware, run_qemu, flash_firmware, *file_tools],
         before_model_callback=before_model,
         after_model_callback=after_model,
     )

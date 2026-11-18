@@ -64,7 +64,7 @@ def fake_file_model(operations):
     """Request real ADK file operations without contacting Gemini."""
     async def generate(model, llm_request, stream=False):
         assert set(llm_request.tools_dict) == {
-            "ReadFile", "WriteFile", "EditFile", "compile_firmware", "run_qemu", "flash_firmware",
+            "ReadFile", "WriteFile", "EditFile", "list_directory", "compile_firmware", "run_qemu", "flash_firmware",
         }  # In particular, shell execution must not be offered to the model.
         results = [
             part.function_response
@@ -252,6 +252,48 @@ class ApiTests(unittest.TestCase):
         results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
         self.assertTrue(all(result["status"] == "error" for result in results))
         self.assertFalse(outside.exists())
+
+    def test_directory_listing_discovers_existing_source_for_model(self):
+        project = self.workspace_root / "uart-hello" / "src"
+        project.mkdir(parents=True)
+        (project / "main.c").write_text("int main(void) { return 0; }\n")
+        with patch(MODEL_METHOD, fake_file_model([
+            ("list_directory", {}),
+            ("list_directory", {"path": "uart-hello/src"}),
+            ("ReadFile", {"path": "uart-hello/src/main.c"}),
+        ])):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
+        self.assertEqual(results[0]["entries"], [{"name": "uart-hello", "path": "uart-hello", "type": "directory"}])
+        self.assertEqual(results[1]["entries"], [{"name": "main.c", "path": "uart-hello/src/main.c", "type": "file"}])
+        self.assertIn("return 0", results[2]["content"])
+
+    def test_directory_listing_rejects_escape_links_missing_and_file_paths(self):
+        self.workspace_root.mkdir()
+        (self.workspace_root / "file.c").write_text("test")
+        (self.workspace_root / "outside-link").symlink_to(self.workspace_root.parent, target_is_directory=True)
+        operations = [("list_directory", {"path": path}) for path in (
+            "..", str(self.workspace_root.parent), "outside-link", "missing", "file.c",
+        )]
+        with patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
+        self.assertTrue(all(result["status"] == "error" for result in results))
+
+    def test_directory_listing_handles_empty_and_truncated_directories(self):
+        self.workspace_root.mkdir()
+        with patch(MODEL_METHOD, fake_file_model([("list_directory", {})])):
+            empty = self.submit().json()["tool_events"][1]["result"]
+        self.assertEqual(empty["entries"], [])
+        self.assertFalse(empty["truncated"])
+        for index in range(201):
+            (self.workspace_root / f"file-{index:03}.c").touch()
+        with patch(MODEL_METHOD, fake_file_model([("list_directory", {})])):
+            listing = self.submit().json()["tool_events"][1]["result"]
+        self.assertEqual(len(listing["entries"]), 200)
+        self.assertTrue(listing["truncated"])
 
     @unittest.skipUnless(shutil.which(firmware_build.CC) and shutil.which(firmware_build.OBJCOPY), "ARM toolchain not installed")
     def test_agent_writes_and_really_compiles_firmware(self):
