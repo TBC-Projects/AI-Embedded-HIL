@@ -1,34 +1,21 @@
-export type Stage = 'Idle' | 'Editing' | 'Compiling' | 'Waiting for device' | 'Testing' | 'Finished' | 'Stopped';
-export type ExecutionStatus = 'idle' | 'running' | 'finished' | 'stopped';
-export type TestOutcome = 'passed' | 'failed' | 'unable to test' | 'stopped';
-export type Source = 'Agent' | 'Build' | 'Device' | 'Test';
-
-export interface WorkflowEvent {
-  runId: string;
+export interface LogEntry {
+  type: 'log';
+  run_id: string;
   timestamp: string;
-  source: Source;
+  source: string;
   message: string;
-  details?: string;
+  details?: string | null;
 }
-export interface TestEvidence {
-  attempt: number;
-  outcome: 'passed' | 'failed' | 'unable to test';
-  expected: string;
-  observed: string;
+
+export interface AgentResult {
+  session_id: string;
+  model: string;
+  workspace: string;
+  final_response: string;
 }
-export interface WorkflowResult {
-  runId: string;
-  outcome: TestOutcome;
-  summary: string;
-  attempts: number;
-  evidence: TestEvidence[];
-  diff: string;
-}
-export interface WorkflowObserver {
-  onProgress(stage: Stage, attempt: number): void;
-  onEvent(event: WorkflowEvent): void;
-  onResult(result: WorkflowResult): void;
-}
-export interface Workflow {
-  start(request: { runId: string; task: string }, observer: WorkflowObserver): { stop(): void };
-}
+
+export type StreamEvent = LogEntry | {
+  type: 'final';
+  run_id: string;
+  result: AgentResult;
+};

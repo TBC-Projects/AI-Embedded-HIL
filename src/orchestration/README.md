@@ -5,7 +5,7 @@ calls and can use ADK's built-in ReadFile, WriteFile, and EditFile tools to crea
 real local source files. compile_firmware calls the local compiler.py helper to produce
 real ARM binaries. Only flash_firmware remains simulated; no Raspberry Pi is
 contacted. run_qemu can execute a build for a bounded observation window and return
-its UART output to Gemini. The dashboard still uses its separate browser-local mock workflow.
+its UART output to Gemini. The dashboard streams real backend activity and inline QEMU captures.
 
 ## Run locally
 
@@ -44,8 +44,8 @@ cleanup with a run ID and elapsed seconds. Every 10 seconds a local heartbeat
 reports the current stage; it does not imply Google is making progress. Prompts
 and model thought content are not logged. There is no overall time limit yet.
 API docs are at
-http://127.0.0.1:8000/docs. Requests wait until completion; there is no streaming or
-background job queue.
+http://127.0.0.1:8000/docs. POST /tasks keeps its JSON response for curl.
+The dashboard uses POST /tasks/stream for live logs; no background job queue is used.
 
 ## Generate a real local file
 
@@ -228,8 +228,8 @@ returns 503; invalid task input returns 422; an unsuccessful Gemini/ADK run retu
 
 The compile tool uses this directory's compiler.py; it does not call src/build,
 the harness, or the rest of that pipeline. The flash stub only checks the artifact ID.
-No general shell tool, automatic firmware test verdict, hardware
-protocols, UART/FPGA retrieval, authentication, or dashboard integration is included.
+No general shell tool, automatic firmware test verdict, physical hardware
+protocols, FPGA retrieval, or authentication is included.
 Orchestration owns agent decisions and limits; runner will own concrete hardware
 operations. Its unresolved interfaces are documented in src/runner/README.md.
 
@@ -237,7 +237,7 @@ operations. Its unresolved interfaces are documented in src/runner/README.md.
 
 ```sh
 python -m pip install -r src/orchestration/requirements-dev.txt
-python -m unittest src.orchestration.test_api src.orchestration.test_qemu
+python -m unittest src.orchestration.test_api src.orchestration.test_qemu src.orchestration.test_stream
 ```
 
 Tests replace the model transport. Most mock the build stage to test ADK plumbing;
@@ -249,3 +249,30 @@ missing tools, invalidation after a failed rebuild, artifact handoff, fresh
 sessions, real file write/read/edit and persistence, workspace path rejection,
 shell-tool exclusion, thought filtering, request validation, and error responses. They do not
 verify Gemini connectivity, credentials, quota, or real model tool selection.
+
+## Dashboard streaming and Stop
+
+Start this backend on 127.0.0.1:8000, then run `npm run dev` in src/dashboard and
+open Vite's Local URL. The frontend proxies /api to this backend. Run submits one
+prompt and streams application log messages, inline QEMU UART captures, and the
+final answer. It does not manufacture progress stages or firmware test verdicts.
+
+`POST /tasks/stream?run_id=<UUID>` accepts the same task JSON as /tasks. It returns
+application/x-ndjson: each line is either a `log` event (run_id, timestamp, source,
+message, optional details) or a `final` event containing the result. QEMU UART is
+labeled `QEMU UART`; emulator diagnostics are labeled `QEMU`. Provider errors are
+redacted and sent as Error log entries. No prompts or model thought parts are
+logged. HTTP validation, missing-key, and busy errors happen before streaming.
+
+`POST /tasks/<UUID>/stop` cancels that active run and waits for cleanup. Closing
+the stream also cancels the run. Cancelled QEMU observations terminate their child
+processes. A compiler already running in a worker thread finishes before the
+workspace is released, so Stop may briefly wait. The log explains this wait.
+
+Both task endpoints share one active-run limit per backend process. A second run
+returns 409 rather than editing the shared files concurrently. Use a single
+Uvicorn worker for this local MVP. Sessions and logs are not persisted or resumable.
+The existing POST /tasks still returns its original complete JSON result.
+
+The HTTP streaming tests bind a temporary loopback port and verify events arriving
+before completion, conflict rejection, Stop cleanup, and cancellation on disconnect.

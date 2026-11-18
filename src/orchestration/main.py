@@ -6,11 +6,14 @@ import json
 import os
 import re
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+from anyio import CancelScope
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from google.adk.agents import Agent
 from google.adk.agents.run_config import RunConfig
 from google.adk.environment import LocalEnvironment
@@ -35,6 +38,40 @@ APP_NAME = "firmware_mvp"
 PROGRESS_INTERVAL_SECONDS = 10
 WORKSPACE_ROOT = Path(__file__).resolve().parent / "workspaces"
 BUILD_SUPPORT_DIR = Path(__file__).resolve().parent / "firmware"
+active_run: asyncio.Task | None = None
+active_run_id: str | None = None
+
+
+def redact(text: str) -> str:
+    for name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+        secret = os.environ.get(name)
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return re.sub(r"(?:AIza|AQ\.)[A-Za-z0-9_.-]+", "[REDACTED]", text)
+
+
+def error_detail(error: Exception) -> str:
+    print(f"Agent run failed ({type(error).__name__}).", flush=True)
+    if isinstance(error, APIError):
+        diagnostic = redact(json.dumps({
+            "google_http_code": error.code, "google_status": error.status,
+            "message": error.message,
+        }))
+        print(f"Google API diagnostic: {diagnostic}", flush=True)
+        return f"Google API error: {diagnostic}"
+    return "Agent run failed. See the backend terminal for diagnostics."
+
+
+def start_run(request, run_id, emit=None):
+    """One active run per backend process, including cleanup after cancellation."""
+    global active_run, active_run_id
+    if not os.environ.get("GOOGLE_API_KEY", "").strip():
+        raise HTTPException(status_code=503, detail="Set GOOGLE_API_KEY before submitting a task.")
+    if active_run is not None and not active_run.done():
+        raise HTTPException(status_code=409, detail="Another run is active. Stop it or wait for it to finish.")
+    active_run_id = run_id
+    active_run = asyncio.create_task(run_agent_loop(request, emit=emit, run_id=run_id))
+    return active_run
 
 
 class TaskRequest(BaseModel):
@@ -56,45 +93,84 @@ def health() -> dict[str, str]:
 @app.post("/tasks")
 async def submit_task(request: TaskRequest) -> dict:
     """Wait for one agent run and return its answer and tool transcript."""
-    if not os.environ.get("GOOGLE_API_KEY", "").strip():
-        raise HTTPException(status_code=503, detail="Set GOOGLE_API_KEY before submitting a task.")
+    task = start_run(request, uuid4().hex)
     try:
-        return await run_agent_loop(request)
+        return await task
+    except asyncio.CancelledError:
+        raise HTTPException(status_code=409, detail="Run stopped.")
     except Exception as error:
-        print(f"Agent run failed ({type(error).__name__}).", flush=True)
-        if isinstance(error, APIError):
-            # Print only the provider's diagnostic fields, not a raw traceback,
-            # request headers, or full response. Redact keys before printing.
-            diagnostic = json.dumps({
-                "google_http_code": error.code,
-                "google_status": error.status,
-                "message": error.message,
-            })
-            for name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
-                secret = os.environ.get(name)
-                if secret:
-                    diagnostic = diagnostic.replace(secret, "[REDACTED]")
-            diagnostic = re.sub(
-                r"(?:AIza|AQ\.)[A-Za-z0-9_.-]+", "[REDACTED]", diagnostic,
-            )
-            print(f"Google API diagnostic: {diagnostic}", flush=True)
-        raise HTTPException(
-            status_code=502,
-            detail="Gemini/ADK did not complete the run. Check the API key, model access, "
-            "quota, and network connection. See the backend terminal for Google's "
-            "redacted error details. Builds are real; only flashing is simulated.",
-        ) from error
+        raise HTTPException(status_code=502, detail=error_detail(error)) from error
 
 
-async def run_agent_loop(task: TaskRequest) -> dict:
+@app.post("/tasks/stream")
+async def stream_task(request: TaskRequest, run_id: UUID):
+    """Stream newline-delimited JSON: log entries followed by the final answer."""
+    queue = asyncio.Queue()
+    run_id = str(run_id)
+    task = start_run(request, run_id, emit=queue.put_nowait)
+
+    async def produce():
+        try:
+            result = await task
+            queue.put_nowait({"type": "final", "run_id": run_id, "result": result})
+        except asyncio.CancelledError:
+            queue.put_nowait({"type": "log", "run_id": run_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "source": "Backend", "message": "Run stopped; resources released."})
+        except Exception as error:
+            queue.put_nowait({"type": "log", "run_id": run_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "source": "Error", "message": error_detail(error)})
+        finally:
+            queue.put_nowait(None)
+
+    producer = asyncio.create_task(produce())
+
+    async def body():
+        try:
+            while (event := await queue.get()) is not None:
+                yield redact(json.dumps(event)) + "\n"
+        finally:
+            # A closed browser/tab also cancels the server run. Shield cleanup
+            # from Starlette's disconnect cancellation until child processes stop.
+            with CancelScope(shield=True):
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+                await producer
+
+    return StreamingResponse(body(), media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/tasks/{run_id}/stop")
+async def stop_task(run_id: UUID):
+    if str(run_id) != active_run_id or active_run is None or active_run.done():
+        raise HTTPException(status_code=404, detail="This run is no longer active.")
+    task = active_run
+    if not task.cancelling():
+        task.cancel()
+    with suppress(asyncio.CancelledError, Exception):
+        await task
+    return {"message": "Run stopped."}
+
+
+async def run_agent_loop(task: TaskRequest, emit=None, run_id=None) -> dict:
     """Let ADK handle model -> tool -> model turns for one fresh session."""
-    run_id = uuid4().hex
+    run_id = run_id or uuid4().hex
     started = monotonic()
     phase = "setting up the agent"
     model_calls = 0
 
-    def log(message: str) -> None:
+    def log(message: str, source="Agent", details=None) -> None:
+        message = redact(message)
+        details = redact(details) if details is not None else None
         print(f"[{run_id} +{monotonic() - started:.1f}s] {message}", flush=True)
+        if details:
+            print(details, flush=True)
+        if emit:
+            emit({"type": "log", "run_id": run_id,
+                  "timestamp": datetime.now(timezone.utc).isoformat(),
+                  "source": source, "message": message, "details": details})
 
     # These ADK callbacks observe model turns without printing prompts or thoughts.
     def before_model(callback_context, llm_request):
@@ -155,7 +231,7 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             return {"status": "error", "simulated": False, "blame": "code",
                     "feedback": "Project directory does not exist. Write project/src/main.c first."}
 
-        log(f"Compiling {project} with {firmware_build.CC} (REAL).")
+        log(f"Compiling {project} with {firmware_build.CC} (REAL).", "Build")
         phase_before_build = phase
         phase = f"compiling {project_dir} with {firmware_build.CC}"
         # Keep blocking compiler processes off the asynchronous server event loop.
@@ -166,7 +242,14 @@ async def run_agent_loop(task: TaskRequest) -> dict:
                     return {"status": "error", "simulated": False, "blame": "code",
                             "feedback": f"Fixed support file {name} must not be a symlink."}
                 shutil.copyfile(BUILD_SUPPORT_DIR / name, destination)
-            result = await asyncio.to_thread(firmware_build.run, project)
+            build_task = asyncio.create_task(asyncio.to_thread(firmware_build.run, project))
+            try:
+                result = await asyncio.shield(build_task)
+            except asyncio.CancelledError:
+                log("Stop requested; waiting for the compiler to finish before releasing the workspace.", "Build")
+                with suppress(Exception):
+                    await build_task
+                raise
         except OSError as error:
             log(f"Build setup failed ({type(error).__name__}).")
             return {"status": "error", "simulated": False, "blame": "rig",
@@ -174,7 +257,7 @@ async def run_agent_loop(task: TaskRequest) -> dict:
         finally:
             phase = phase_before_build
 
-        log(f"Build {'succeeded' if result.ok else 'failed'}: {result.summary}")
+        log(f"Build {'succeeded' if result.ok else 'failed'}: {result.summary}", "Build")
         if result.ok:
             built_artifact = f"firmware-{uuid4().hex}"
             built_elf = Path(result.artifacts["elf"])
@@ -298,11 +381,21 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             for call in event.get_function_calls():
                 entry = {"type": "tool_call", "name": call.name, "arguments": call.args}
                 tool_events.append(entry)
-                log(json.dumps(entry))
+                log(f"Tool call: {call.name}", details=json.dumps(call.args, indent=2))
             for response in event.get_function_responses():
                 entry = {"type": "tool_result", "name": response.name, "result": response.response}
                 tool_events.append(entry)
-                log(json.dumps(entry))
+                payload = response.response
+                if response.name == "run_qemu":
+                    metadata = {key: value for key, value in payload.items()
+                                if key not in {"uart_output", "qemu_errors"}}
+                    log("QEMU observation returned.", "QEMU", json.dumps(metadata, indent=2))
+                    log("Captured UART output", "QEMU UART", payload.get("uart_output") or "(no UART output)")
+                    if payload.get("qemu_errors"):
+                        log("Emulator diagnostics", "QEMU", payload["qemu_errors"])
+                else:
+                    log(f"Tool result: {response.name}", "Build" if response.name == "compile_firmware" else "Agent",
+                        json.dumps(payload, indent=2))
             if event.is_final_response() and event.content:
                 # Do not expose model thought/reasoning parts.
                 final_response = "".join(

@@ -2,17 +2,18 @@
 
 ## Current MVP boundary
 
-The dashboard is a React/TypeScript/Vite page with an independent, browser-local
-mock workflow. It plays fixed sample agent actions, build output, UART feedback,
-and a failed-test/revision/passing-test sequence. It does not execute the submitted
-task. FastAPI exposes health and a task endpoint using one Google ADK Agent with
+The dashboard is a React/TypeScript/Vite page connected to the backend with an
+HTTP stream. It submits a prompt and displays a chronological activity log with
+inline QEMU UART captures and a final answer. There are no mock stages or test
+verdicts. FastAPI exposes health and task endpoints using one Google ADK Agent with
 Gemini and an InMemoryRunner. Each task creates a fresh session. The compile tool
 calls the bundled `src/orchestration/compiler.py` helper with templates from
 `src/orchestration/firmware/`; flashing remains simulated. Built-in ADK file tools
 can write, read, and edit real source files in one shared persistent workspace
 (`src/orchestration/workspaces/`). Conversation sessions remain separate per request.
 The backend calls Gemini and can produce real ELF/binary artifacts, but no hardware
-is accessed. There is no hardware runner service or dashboard/backend connection.
+is accessed. There is no hardware runner service. One run is allowed per backend
+process; Stop and stream disconnects cancel the run and clean up its resources.
 The optional run_qemu tool captures a bounded emulated UART log and returns it to
 the model without assigning an automatic firmware test verdict.
 See the component READMEs for setup.

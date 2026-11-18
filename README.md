@@ -42,8 +42,8 @@ This report serves two primary functions:
 
 ## Local MVP
 
-The current implementation is a browser-local demonstration plus an independent
-FastAPI endpoint using Google ADK and Gemini with local file tools, real ARM
+The current implementation is a React dashboard connected to a FastAPI backend
+using Google ADK and Gemini with local file tools, real ARM
 compilation through `src/orchestration/compiler.py`, bounded QEMU UART observations,
 and simulated flashing. The agent can
 save and revise real source files in the shared
@@ -60,19 +60,19 @@ npm ci
 npm run dev
 ```
 
-Open the local URL printed by Vite. Run plays a fixed simulated UART example:
-failed test → scripted revision → passing test. The task is not interpreted or
-executed. All evidence and the illustrative diff are simulated, and the real device
-indicator stays Disconnected. Stop cancels playback.
+Open the local URL printed by Vite after starting the backend below. Run submits
+your prompt to the real agent. One chronological log shows backend activity and
+inline QEMU UART captures; a separate panel shows Gemini's final answer. Stop
+cancels backend work and waits for cleanup. Only one run can be active at a time.
 
 Backend (Python 3.10+, from the repository root):
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r src/orchestration/requirements.txt
+./.venv/bin/python -m pip install -r src/orchestration/requirements.txt
 export GOOGLE_API_KEY='your-Google-AI-Studio-API-key'
-python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
+./.venv/bin/python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 `GET /health` returns 200. `POST /tasks` sends the prompt to a Gemini agent with
@@ -80,12 +80,12 @@ local file tools, real compile and bounded QEMU tools, and simulated flashing. I
 answer, and tool transcript. See the [file generation example](src/orchestration/README.md#generate-a-real-local-file) and
 [test prompts and long-wait notes](src/orchestration/README.md#long-waits-and-test-prompts)
 before testing: some runs have waited a long time for a final model response, and
-there is no overall backend timeout. The frontend remains independent and does
-not need this server running.
+there is no overall backend timeout. The frontend needs this server running and
+uses /tasks/stream through Vite's /api proxy. Closing the stream cancels its run.
 
 | Directory | Responsibility and integration point |
 | --- | --- |
-| `src/dashboard/` | UI; typed workflow interface and replaceable mock workflow. Connect a future backend transport here. |
+| `src/dashboard/` | Prompt, streamed chronological backend/QEMU log, Stop, and final answer. |
 | `src/orchestration/` | API and future isolated agent loop, permitted tool calls, revisions, and retry limits. |
 | `src/runner/` | Future build/artifact handling, upload/start, UART/FPGA feedback, timeout/reset/recovery. No service yet. |
 | `src/target/` | Raspberry Pi firmware (unchanged). |

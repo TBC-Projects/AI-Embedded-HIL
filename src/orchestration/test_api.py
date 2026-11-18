@@ -5,10 +5,12 @@ import unittest
 import io
 import shutil
 import zlib
+import json
+from uuid import uuid4
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 from google.adk.models.llm_response import LlmResponse
@@ -379,6 +381,24 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["tool_events"][1]["result"]["execution_status"], "invalid_request")
         observe.assert_not_called()
+
+    def test_stream_delivers_logs_qemu_capture_and_final_answer(self):
+        run_id = str(uuid4())
+        with patch(MODEL_METHOD, fake_file_model([
+            ("compile_firmware", {}), ("run_qemu", {}),
+        ])), patch("src.orchestration.main.firmware_qemu.observe", new=AsyncMock(return_value={
+            "execution_status": "observation_complete", "uart_output": "HIL:BOOT\nHello\nHIL:DONE\n",
+            "qemu_errors": "", "stopped_by": "observation_limit",
+        })):
+            response = self.client.post(f"/tasks/stream?run_id={run_id}", json={"task": "Compile and observe"})
+        self.assertEqual(response.status_code, 200, response.text)
+        events = [json.loads(line) for line in response.text.splitlines()]
+        self.assertTrue(all(event["run_id"] == run_id for event in events))
+        self.assertTrue(all(event["type"] in {"log", "final"} for event in events))
+        uart = next(event for event in events if event.get("source") == "QEMU UART")
+        self.assertIn("Hello", uart["details"])
+        self.assertEqual(events[-1]["type"], "final")
+        self.assertNotIn("Private reasoning", response.text)
 
 
 class ProgressTests(unittest.IsolatedAsyncioTestCase):
