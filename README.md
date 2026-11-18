@@ -44,7 +44,7 @@ This report serves two primary functions:
 
 The current implementation is a browser-local demonstration plus an independent
 FastAPI endpoint using Google ADK and Gemini with local file tools, real ARM
-compilation through `src/build/build.py`, and simulated flashing. The agent can
+compilation through `src/orchestration/compiler.py`, and simulated flashing. The agent can
 save and revise real source files in the shared
 `src/orchestration/workspaces/` directory across requests. Each conversation starts
 fresh. Builds require the ARM toolchain described in the orchestration README.

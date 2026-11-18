@@ -2,7 +2,7 @@
 
 One Google ADK Agent and InMemoryRunner handle each task. Gemini makes real API
 calls and can use ADK's built-in ReadFile, WriteFile, and EditFile tools to create
-real local source files. compile_firmware now calls src/build/build.py to produce
+real local source files. compile_firmware calls the local compiler.py helper to produce
 real ARM binaries. Only flash_firmware remains simulated; no Raspberry Pi is
 contacted. The dashboard still uses its separate browser-local mock workflow.
 
@@ -92,16 +92,38 @@ arm-none-eabi-objcopy --version
 For example, have the agent write `build-demo/src/main.c`, then call
 `compile_firmware(project_dir="build-demo")`. The directory must be inside the
 shared workspace. With no argument, the tool builds the workspace root and expects
-`src/*.c` there. The existing build stage compiles direct children of `src/`, not
+`src/*.c` there. The compiler helper compiles direct children of `src/`, not
 arbitrarily nested sources. A standalone file such as `uart-hello/main.c` must be
 placed under `uart-hello/src/main.c` before using that project layout.
 
 Before each build, orchestration copies the fixed `start.S`, `linker.ld`, `hil.c`,
-and `hil.h` files from `src/build/target/` into the project root, replacing those
+and `hil.h` files from `src/orchestration/firmware/` into the project root, replacing those
 support copies. Generated firmware should not edit them. Use freestanding C with
 `int main(void)`; libc/stdio are unavailable. For UART output, include `hil.h` and
-use `hil_puts`. Then the existing `build.run(project)` compiles and links the code
+use `hil_puts`. Then `compiler.run(project)` compiles and links the code
 and produces `kernel.elf`, `kernel.bin`, and `build.log` in that project.
+
+All Python and firmware support for this agent MVP lives in this directory:
+
+```text
+src/orchestration/
+  main.py             FastAPI, ADK agent, and tools
+  compiler.py         ARM compiler invocation and structured build results
+  firmware/
+    start.S           stack/BSS setup, then hil_init -> main -> hil_exit
+    linker.ld         memory layout and entry point
+    hil.c             UART output, status markers, GPIO helpers
+    hil.h             declarations and register definitions
+  workspaces/         persistent generated projects and build output (ignored by Git)
+```
+
+The compiler helper and templates were adapted from the separate `src/build/`
+pipeline, but orchestration does not import or copy files from it anymore.
+External requirements are still the Python packages and ARM toolchain.
+Change the templates in `firmware/`, not generated workspace copies: the next
+compile refreshes the copies. After main returns, hil_exit prints `HIL:DONE` and
+loops without requesting a watchdog reset. QEMU stays open until stopped.
+hil_panic retains its existing watchdog reset behavior on an explicit failure.
 
 The blocking build runs in a worker thread so terminal heartbeats and other HTTP
 requests can continue. Success returns an artifact ID and the existing build
@@ -160,8 +182,8 @@ means an answer was returned, not that real firmware was tested. Missing API key
 returns 503; invalid task input returns 422; an unsuccessful Gemini/ADK run returns
 502 without exposing provider internals.
 
-The compile tool reuses the build stage directly; it does not call the unfinished
-harness or the rest of the pipeline. The flash stub only checks the artifact ID.
+The compile tool uses this directory's compiler.py; it does not call src/build,
+the harness, or the rest of that pipeline. The flash stub only checks the artifact ID.
 No general shell tool, runtime firmware validation, hardware
 protocols, UART/FPGA retrieval, authentication, or dashboard integration is included.
 Orchestration owns agent decisions and limits; runner will own concrete hardware

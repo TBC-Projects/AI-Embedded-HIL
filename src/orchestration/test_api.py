@@ -18,8 +18,8 @@ from google.genai import types
 from google.genai.errors import ClientError
 
 from src.orchestration.main import MODEL, TaskRequest, app, run_agent_loop
-from src.build import build as firmware_build
-from src.build.common import StageResult
+from src.orchestration import compiler as firmware_build
+from src.orchestration.compiler import StageResult
 
 MODEL_METHOD = "google.adk.models.google_llm.Gemini.generate_content_async"
 

@@ -20,7 +20,7 @@ from google.genai import types
 from google.genai.errors import APIError
 from pydantic import BaseModel, Field, field_validator
 
-from src.build import build as firmware_build
+from . import compiler as firmware_build
 
 # This demo uses the Gemini API with GOOGLE_API_KEY, rather than Vertex AI.
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "FALSE"
@@ -31,7 +31,7 @@ MODEL = "gemini-3.8-flash"
 APP_NAME = "firmware_mvp"
 PROGRESS_INTERVAL_SECONDS = 10
 WORKSPACE_ROOT = Path(__file__).resolve().parent / "workspaces"
-BUILD_SUPPORT_DIR = Path(firmware_build.__file__).resolve().parent / "target"
+BUILD_SUPPORT_DIR = Path(__file__).resolve().parent / "firmware"
 
 
 class TaskRequest(BaseModel):
