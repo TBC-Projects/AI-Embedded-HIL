@@ -44,7 +44,8 @@ This report serves two primary functions:
 
 The current implementation is a browser-local demonstration plus an independent
 FastAPI endpoint using Google ADK and Gemini with local file tools, real ARM
-compilation through `src/orchestration/compiler.py`, and simulated flashing. The agent can
+compilation through `src/orchestration/compiler.py`, bounded QEMU UART observations,
+and simulated flashing. The agent can
 save and revise real source files in the shared
 `src/orchestration/workspaces/` directory across requests. Each conversation starts
 fresh. Builds require the ARM toolchain described in the orchestration README.
@@ -75,7 +76,7 @@ python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 80
 ```
 
 `GET /health` returns 200. `POST /tasks` sends the prompt to a Gemini agent with
-local file tools, a real compile tool, and simulated flashing. It returns the workspace path,
+local file tools, real compile and bounded QEMU tools, and simulated flashing. It returns the workspace path,
 answer, and tool transcript. See the [file generation example](src/orchestration/README.md#generate-a-real-local-file) and
 [test prompts and long-wait notes](src/orchestration/README.md#long-waits-and-test-prompts)
 before testing: some runs have waited a long time for a final model response, and

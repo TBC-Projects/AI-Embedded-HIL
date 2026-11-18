@@ -4,7 +4,8 @@ One Google ADK Agent and InMemoryRunner handle each task. Gemini makes real API
 calls and can use ADK's built-in ReadFile, WriteFile, and EditFile tools to create
 real local source files. compile_firmware calls the local compiler.py helper to produce
 real ARM binaries. Only flash_firmware remains simulated; no Raspberry Pi is
-contacted. The dashboard still uses its separate browser-local mock workflow.
+contacted. run_qemu can execute a build for a bounded observation window and return
+its UART output to Gemini. The dashboard still uses its separate browser-local mock workflow.
 
 ## Run locally
 
@@ -70,7 +71,7 @@ so tell it which existing files to read. Submit tasks one at a time to avoid
 simultaneous edits to the shared files. Files are not automatically cleared.
 
 In main.py, EnvironmentToolset supplies existing ADK implementations. We select
-its three file tools and register them beside compile_firmware and flash_firmware.
+its three file tools and register them beside compile_firmware, run_qemu, and flash_firmware.
 The shell Execute tool is not registered. Gemini supplies file paths and contents
 as structured tool arguments; no code-block extractor is used. File tool calls
 and results appear in the same transcript as compile/flash, including code content.
@@ -109,6 +110,7 @@ All Python and firmware support for this agent MVP lives in this directory:
 src/orchestration/
   main.py             FastAPI, ADK agent, and tools
   compiler.py         ARM compiler invocation and structured build results
+  qemu.py             bounded execution and UART/diagnostic capture
   firmware/
     start.S           stack/BSS setup, then hil_init -> main -> hil_exit
     linker.ld         memory layout and entry point
@@ -133,9 +135,51 @@ only from the latest successful build in this task. A failed rebuild clears it.
 Compiler errors return `status: error`, `blame: code`, and feedback Gemini can
 use to edit the file and compile again. Missing tools/support files are setup
 failures (`blame: rig`); the agent should report them rather than rewrite firmware.
-A successful compilation does not establish correct runtime behavior. QEMU,
-hardware execution, and UART/FPGA collection are not called by this integration.
+A successful compilation does not establish correct runtime behavior. Use run_qemu
+for emulator observations. Physical hardware execution and FPGA capture remain future work.
 LocalEnvironment is a local development tool, not an OS sandbox.
+
+## Observe firmware in QEMU
+
+Install QEMU if needed: `brew install qemu` on macOS, or
+`sudo apt install qemu-system-arm` on Ubuntu. No extra Python dependency is needed.
+
+Restart the backend, then in another terminal:
+
+```sh
+curl -sS --max-time 90 http://127.0.0.1:8000/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"task":"Use WriteFile to create qemu-demo/src/main.c that includes hil.h and defines int main(void) which calls hil_puts with Hello from firmware, then returns 0. Compile project qemu-demo. If compilation succeeds, call run_qemu with the returned artifact_id and duration_seconds 1. Interpret its uart_output and qemu_errors, report what was observed, and finish. Do not flash."}' \
+  | python3 -m json.tool
+```
+
+The agent calls `run_qemu(artifact_id, duration_seconds=1.0)`. The ID must come
+from the latest successful compile in this task. Each call starts a fresh QEMU
+process, collects output, stops it, and returns the observation to Gemini through
+ADK's normal tool-result flow. It does not keep an emulator running between calls.
+
+The helper launches the same `qemu-system-arm -M raspi0 -kernel ... -display none
+-serial stdio -monitor none` command used manually, with stdout/stderr pipes.
+It drains both pipes while running. The observation defaults to one second and
+can be greater than zero up to ten seconds. Startup and cleanup add overhead.
+The process is also stopped and reaped if the agent task is cancelled.
+
+The tool returns `uart_output`, `qemu_errors`, `observed_seconds`, `execution_status`,
+`stopped_by`, and `exit_code`. An observation ending normally has
+`execution_status: observation_complete` and `stopped_by: observation_limit`;
+`exit_code` is null because Python intentionally stopped QEMU. An early process
+exit includes its exit code. Missing QEMU or ELF returns an infrastructure error.
+Output is limited to the first 64 KiB per stream, with truncation flags; excess
+bytes are drained and discarded to avoid blocking the emulator or growing RAM usage.
+
+The UART log and diagnostics appear in `tool_events` in the API response and the
+backend terminal. Gemini can interpret them, edit files, rebuild, and run again.
+`HIL:DONE` does not stop observation early; firmware that loops forever is also
+observed for the chosen window. Tool success means output collection completed,
+not that firmware passed a test. Empty output, HIL:PANIC, or unexpected text are
+evidence for the agent to interpret against your task. This is not an FPGA trace
+or a measurement of real hardware timing. No mandatory QEMU pass gate is added
+to the simulated flash tool. Rebuilding invalidates the previous run's artifact ID.
 
 ## Long waits and test prompts
 
@@ -161,11 +205,11 @@ backend before retrying so the earlier run does not remain active.
 
 1. FastAPI validates TaskRequest: nonblank text, at most 10,000 characters.
 2. The endpoint checks GOOGLE_API_KEY and awaits run_agent_loop.
-3. That function defines compile_firmware and flash_firmware, with build state
+3. That function defines compile_firmware, run_qemu, and flash_firmware, with build state
    private to this request. ADK turns their names, docstrings, and type annotations
    into tool descriptions Gemini can use.
 4. ADK's EnvironmentToolset supplies three local file tools in the shared workspace.
-   An Agent gives Gemini instructions, those file tools, the real compile tool,
+   An Agent gives Gemini instructions, those file tools, the real compile/QEMU tools,
    and simulated flash tool. An InMemoryRunner creates
    a fresh session and manages model/tool/model turns. A session holds this run's
    conversation and tool results in RAM; no conversation is reused across tasks.
@@ -184,7 +228,7 @@ returns 503; invalid task input returns 422; an unsuccessful Gemini/ADK run retu
 
 The compile tool uses this directory's compiler.py; it does not call src/build,
 the harness, or the rest of that pipeline. The flash stub only checks the artifact ID.
-No general shell tool, runtime firmware validation, hardware
+No general shell tool, automatic firmware test verdict, hardware
 protocols, UART/FPGA retrieval, authentication, or dashboard integration is included.
 Orchestration owns agent decisions and limits; runner will own concrete hardware
 operations. Its unresolved interfaces are documented in src/runner/README.md.
@@ -193,12 +237,14 @@ operations. Its unresolved interfaces are documented in src/runner/README.md.
 
 ```sh
 python -m pip install -r src/orchestration/requirements-dev.txt
-python -m unittest src.orchestration.test_api
+python -m unittest src.orchestration.test_api src.orchestration.test_qemu
 ```
 
 Tests replace the model transport. Most mock the build stage to test ADK plumbing;
 integration tests use the installed ARM compiler and are skipped if it is absent.
 They verify real binary creation and metadata, compiler-error feedback and repair,
+QEMU UART feedback reaching the model, bounded process cleanup (including cancellation),
+early errors and bounded output buffers,
 missing tools, invalidation after a failed rebuild, artifact handoff, fresh
 sessions, real file write/read/edit and persistence, workspace path rejection,
 shell-tool exclusion, thought filtering, request validation, and error responses. They do not

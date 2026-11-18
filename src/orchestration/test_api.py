@@ -20,6 +20,7 @@ from google.genai.errors import ClientError
 from src.orchestration.main import MODEL, TaskRequest, app, run_agent_loop
 from src.orchestration import compiler as firmware_build
 from src.orchestration.compiler import StageResult
+from src.orchestration import qemu as firmware_qemu
 
 MODEL_METHOD = "google.adk.models.google_llm.Gemini.generate_content_async"
 
@@ -61,7 +62,7 @@ def fake_file_model(operations):
     """Request real ADK file operations without contacting Gemini."""
     async def generate(model, llm_request, stream=False):
         assert set(llm_request.tools_dict) == {
-            "ReadFile", "WriteFile", "EditFile", "compile_firmware", "flash_firmware",
+            "ReadFile", "WriteFile", "EditFile", "compile_firmware", "run_qemu", "flash_firmware",
         }  # In particular, shell execution must not be offered to the model.
         results = [
             part.function_response
@@ -75,8 +76,8 @@ def fake_file_model(operations):
             ]))
             return
         name, args = operations[len(results)]
-        if name == "flash_firmware":
-            args = {"artifact_id": next(
+        if name in {"flash_firmware", "run_qemu"} and "artifact_id" not in args:
+            args = {**args, "artifact_id": next(
                 result.response["artifact_id"] for result in reversed(results)
                 if result.name == "compile_firmware" and result.response["status"] == "success"
             )}
@@ -104,8 +105,10 @@ class ApiTests(unittest.TestCase):
             # Most tests focus on ADK plumbing; real compiler tests follow below.
             binary = project / "kernel.bin"
             binary.write_bytes(b"test binary")
+            elf = project / "kernel.elf"
+            elf.write_bytes(b"test ELF")
             return StageResult("build", True, "test build succeeded", artifacts={
-                "bin": str(binary), "length": binary.stat().st_size,
+                "elf": str(elf), "bin": str(binary), "length": binary.stat().st_size,
             })
 
         build_patch = patch("src.orchestration.main.firmware_build.run", side_effect=test_build)
@@ -327,7 +330,7 @@ class ApiTests(unittest.TestCase):
 
     def test_failed_rebuild_invalidates_previous_artifact(self):
         self.build_mock.side_effect = [
-            StageResult("build", True, "built", artifacts={"bin": "kernel.bin"}),
+            StageResult("build", True, "built", artifacts={"elf": "kernel.elf", "bin": "kernel.bin"}),
             StageResult("build", False, "compile failed", feedback="syntax error"),
         ]
         operations = [("compile_firmware", {}), ("compile_firmware", {}), ("flash_firmware", {})]
@@ -336,6 +339,46 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
         self.assertEqual([result["status"] for result in results], ["success", "error", "error"])
+
+    @unittest.skipUnless(
+        shutil.which(firmware_build.CC) and shutil.which(firmware_build.OBJCOPY)
+        and shutil.which(firmware_qemu.QEMU), "ARM toolchain and QEMU not installed",
+    )
+    def test_qemu_output_reaches_model_after_real_build(self):
+        self.build_mock.side_effect = self.real_build
+        transport = fake_file_model([
+            ("WriteFile", {"path": "hello/src/main.c", "content": '#include "hil.h"\nint main(void) { hil_puts("Hello from firmware\\n"); return 0; }\n'}),
+            ("compile_firmware", {"project_dir": "hello"}),
+            ("run_qemu", {}),
+        ])
+
+        async def inspect_model(model, llm_request, stream=False):
+            for content in llm_request.contents:
+                for part in content.parts or []:
+                    response = part.function_response
+                    if response and response.name == "run_qemu":
+                        self.assertIn("Hello from firmware", response.response["uart_output"])
+                        self.assertEqual(response.response["execution_status"], "observation_complete")
+            async for result in transport(model, llm_request, stream):
+                yield result
+
+        with patch(MODEL_METHOD, inspect_model):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        observation = response.json()["tool_events"][-1]["result"]
+        self.assertEqual(observation["stopped_by"], "observation_limit")
+        self.assertEqual(observation["uart_output"].count("HIL:BOOT"), 1)
+        self.assertEqual(observation["uart_output"].count("HIL:DONE"), 1)
+        self.assertEqual(observation["qemu_errors"], "")
+
+    def test_qemu_rejects_unknown_artifact_without_starting_process(self):
+        with patch("src.orchestration.main.firmware_qemu.observe") as observe, patch(
+            MODEL_METHOD, fake_file_model([("run_qemu", {"artifact_id": "unknown"})]),
+        ):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["tool_events"][1]["result"]["execution_status"], "invalid_request")
+        observe.assert_not_called()
 
 
 class ProgressTests(unittest.IsolatedAsyncioTestCase):

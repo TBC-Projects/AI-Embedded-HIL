@@ -13,6 +13,8 @@ can write, read, and edit real source files in one shared persistent workspace
 (`src/orchestration/workspaces/`). Conversation sessions remain separate per request.
 The backend calls Gemini and can produce real ELF/binary artifacts, but no hardware
 is accessed. There is no hardware runner service or dashboard/backend connection.
+The optional run_qemu tool captures a bounded emulated UART log and returns it to
+the model without assigning an automatic firmware test verdict.
 See the component READMEs for setup.
 
 The detailed Week 5–10 design below is historical planning, not an implemented or

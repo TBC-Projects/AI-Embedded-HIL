@@ -1,4 +1,4 @@
-"""One Gemini agent with local file tools, real ARM builds, and simulated flashing."""
+"""One Gemini agent with local files, ARM builds, bounded QEMU runs, and simulated flashing."""
 
 import asyncio
 from contextlib import suppress
@@ -21,13 +21,16 @@ from google.genai.errors import APIError
 from pydantic import BaseModel, Field, field_validator
 
 from . import compiler as firmware_build
+from . import qemu as firmware_qemu
 
 # This demo uses the Gemini API with GOOGLE_API_KEY, rather than Vertex AI.
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "FALSE"
 
 app = FastAPI(title="Embedded AI HIL orchestration", version="0.1.0")
 # ADK's model registry expects the bare Gemini ID, without the API's models/ prefix.
-MODEL = "gemini-3.8-flash"
+#MODEL = "gemini-3.8-flash"
+#MODEL = "gemini-3.7-flash"
+MODEL = "gemini-3.5-flash-lite"
 APP_NAME = "firmware_mvp"
 PROGRESS_INTERVAL_SECONDS = 10
 WORKSPACE_ROOT = Path(__file__).resolve().parent / "workspaces"
@@ -128,6 +131,7 @@ async def run_agent_loop(task: TaskRequest) -> dict:
     ]
     # Each task tracks its latest successful build for the simulated flash tool.
     built_artifact: str | None = None
+    built_elf: Path | None = None
 
     async def compile_firmware(project_dir: str = ".") -> dict:
         """Build a project's src/*.c files using the real ARM cross-compiler.
@@ -139,9 +143,10 @@ async def run_agent_loop(task: TaskRequest) -> dict:
         Returns compiler feedback on failure, or artifact_id and binary metadata
         on success. A successful build does not prove correct runtime behavior.
         """
-        nonlocal built_artifact, phase
+        nonlocal built_artifact, built_elf, phase
         # A failed rebuild must not leave a previous artifact eligible for flashing.
         built_artifact = None
+        built_elf = None
         project = (workspace / project_dir).resolve()
         if not project.is_relative_to(workspace.resolve()):
             return {"status": "error", "simulated": False, "blame": "code",
@@ -172,6 +177,7 @@ async def run_agent_loop(task: TaskRequest) -> dict:
         log(f"Build {'succeeded' if result.ok else 'failed'}: {result.summary}")
         if result.ok:
             built_artifact = f"firmware-{uuid4().hex}"
+            built_elf = Path(result.artifacts["elf"])
         return {
             "status": "success" if result.ok else "error",
             "simulated": False,
@@ -181,6 +187,30 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             "blame": result.blame if not result.ok else None,
             "artifacts": result.artifacts,
         }
+
+    async def run_qemu(artifact_id: str, duration_seconds: float = 1.0) -> dict:
+        """Run the latest compiled ELF briefly and return its collected UART output.
+
+        Args:
+            artifact_id: Exact ID from the latest successful compile in this task.
+            duration_seconds: Observation window, default 1 second; greater than 0, at most 10.
+
+        QEMU is stopped afterwards, including for continuously running firmware.
+        Returns uart_output and qemu_errors; it does not decide whether tests pass.
+        """
+        nonlocal phase
+        if built_artifact is None or artifact_id != built_artifact or built_elf is None:
+            return {"status": "error", "execution_status": "invalid_request",
+                    "message": "Compile successfully first and use that exact artifact_id. QEMU was not started."}
+        previous_phase = phase
+        phase = f"observing QEMU for up to {duration_seconds} seconds"
+        log(f"Starting bounded QEMU observation: {duration_seconds}s (REAL).")
+        try:
+            result = await firmware_qemu.observe(built_elf, duration_seconds)
+        finally:
+            phase = previous_phase
+        log(f"QEMU observation ended: {result['execution_status']}.")
+        return {"artifact_id": artifact_id, **result}
 
     def flash_firmware(artifact_id: str) -> dict:
         """Simulate flashing the artifact returned by compile_firmware.
@@ -213,7 +243,16 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             "to revise it. Use paths relative to this workspace. File operations are REAL. "
             "When asked to write code, save it with WriteFile rather than only quoting "
             "it in your final answer. Report filenames and any tool errors honestly. "
-            "Compilation is REAL; only flashing is SIMULATED. "
+            "Compilation and QEMU execution are REAL; only flashing is SIMULATED. "
+            "When asked to execute or inspect firmware in emulation, compile first, "
+            "then call run_qemu with the exact artifact_id. It captures UART for one "
+            "second by default (configurable up to ten), stops QEMU, and returns "
+            "uart_output and qemu_errors. Use this evidence to explain behavior or "
+            "revise files, recompile, and run again. Firmware need not return from main. "
+            "observation_complete only means the observation window ended, not that "
+            "firmware passed a test. Check the user's expected output, missing output, "
+            "HIL:PANIC, and diagnostics. Never treat infrastructure errors as firmware "
+            "test failures. This is a UART log, not an FPGA trace or real timing proof. "
             "Save C source under a project's src/ directory, e.g. uart-hello/src/main.c. "
             "Then call compile_firmware(project_dir='uart-hello'). For workspace-root "
             "projects, write src/main.c and use project_dir='.'. The build compiles "
@@ -229,9 +268,9 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             "Use tool results to report what happened. Explain that compilation was real, "
             "flashing was simulated, and no hardware was contacted. A successful build "
             "does not prove the firmware behaves correctly. "
-            "You cannot execute shell commands, access hardware, or test real firmware."
+            "You cannot execute arbitrary shell commands or access physical hardware."
         ),
-        tools=[compile_firmware, flash_firmware, *file_tools],
+        tools=[compile_firmware, run_qemu, flash_firmware, *file_tools],
         before_model_callback=before_model,
         after_model_callback=after_model,
     )
@@ -280,7 +319,7 @@ async def run_agent_loop(task: TaskRequest) -> dict:
             "model": MODEL,
             "workspace": str(workspace),
             "simulated": True,
-            "simulation_note": "Gemini, file operations, and compilation are real; flashing is simulated. No hardware was contacted.",
+            "simulation_note": "Gemini, file operations, compilation, and QEMU runs are real; physical flashing is simulated. No hardware was contacted.",
             "tool_events": tool_events,
             "final_response": final_response,
         }
