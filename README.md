@@ -47,10 +47,10 @@ using Google ADK and Gemini with local file tools, real ARM
 compilation through `src/orchestration/compiler.py`, bounded QEMU UART observations,
 and simulated flashing. The agent can
 save and revise real source files in the shared
-`src/orchestration/workspaces/` directory across requests. Each conversation starts
-fresh. Builds require the ARM toolchain described in the orchestration README.
-The backend does not upload binaries or access hardware. No authentication,
-database, or deployment is included.
+`src/orchestration/workspaces/` directory across all chats. Conversation context and activity logs persist in SQLite;
+follow-up messages reuse the selected chat. Builds require the ARM toolchain described in the orchestration README.
+The backend does not upload binaries or access hardware. SQLite is built into
+Python; pip installs its async adapter. No authentication or deployment is included.
 
 Frontend (Node.js 22.14+):
 
@@ -60,9 +60,9 @@ npm ci
 npm run dev
 ```
 
-Open the local URL printed by Vite after starting the backend below. Run submits
-your prompt to the real agent. One chronological log shows backend activity and
-inline QEMU UART captures; a separate panel shows Gemini's final answer. Stop
+Open the local URL printed by Vite after starting the backend below. Send submits
+your message to the real agent in the selected chat. The sidebar selects saved
+conversations; each turn keeps its chronological backend/QEMU log and Markdown answer. Stop
 cancels backend work and waits for cleanup. Only one run can be active at a time.
 
 Backend (Python 3.10+, from the repository root):
@@ -85,7 +85,7 @@ uses /tasks/stream through Vite's /api proxy. Closing the stream cancels its run
 
 | Directory | Responsibility and integration point |
 | --- | --- |
-| `src/dashboard/` | Prompt, streamed chronological backend/QEMU log, Stop, and final answer. |
+| `src/dashboard/` | Saved conversation sidebar, messages, streamed backend/QEMU logs, Stop, and answers. |
 | `src/orchestration/` | API and future isolated agent loop, permitted tool calls, revisions, and retry limits. |
 | `src/runner/` | Future build/artifact handling, upload/start, UART/FPGA feedback, timeout/reset/recovery. No service yet. |
 | `src/target/` | Raspberry Pi firmware (unchanged). |

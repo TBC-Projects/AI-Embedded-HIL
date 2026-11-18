@@ -1,6 +1,6 @@
 # Orchestration: minimal Gemini agent
 
-One Google ADK Agent and InMemoryRunner handle each task. Gemini makes real API
+One Google ADK Agent and Runner handle each turn, using a saved SQLite session for each chat. Gemini makes real API
 calls and can use ADK's built-in ReadFile, WriteFile, and EditFile tools to create
 real local source files. compile_firmware calls the local compiler.py helper to produce
 real ARM binaries. Only flash_firmware remains simulated; no Raspberry Pi is
@@ -21,7 +21,7 @@ export GOOGLE_API_KEY='your-Google-AI-Studio-API-key'
 
 Get a key from https://aistudio.google.com/apikey. Keep it outside Git. The backend
 reads GOOGLE_API_KEY; this demo explicitly uses the Gemini API rather than Vertex
-AI. Model: `gemini-3.8-flash` (the `MODEL` constant in main.py, without a `models/`
+AI. Model: `gemini-3.5-flash-lite` (the `MODEL` constant in main.py, without a `models/`
 prefix because ADK resolves bare Gemini IDs). Actual model calls
 require model access, available quota, and network connectivity.
 
@@ -35,7 +35,7 @@ curl -sS --max-time 90 http://127.0.0.1:8000/tasks \
   | python3 -m json.tool
 ```
 
-The response contains `session_id`, `model`, `workspace`, `simulated`, `simulation_note`,
+The response contains `chat_id`, `run_id`, `session_id`, `model`, `workspace`, `simulated`, `simulation_note`,
 `tool_events` (calls, arguments, and results), and `final_response`. Tool events and
 Gemini's final answer are also printed in the server terminal. `simulated: true`
 refers to flashing only; Gemini, file operations, and compilation are real. The server logs
@@ -65,10 +65,52 @@ the workspace folder is ignored by Git. Later requests can read and edit prior
 files. The agent can create subdirectories by writing paths such as
 `uart-hello/main.c`. Existing `src/target/` code is untouched.
 
-Each request still has a fresh conversation/session and a new ID for logging;
-that ID no longer creates a directory. The agent does not remember earlier chats,
-so tell it which existing files to read. Submit tasks one at a time to avoid
-simultaneous edits to the shared files. Files are not automatically cleared.
+Each chat has a saved conversation/session. Each submitted turn has its own run ID
+for logging; neither ID creates a workspace directory. A follow-up in the same chat
+remembers earlier messages and tool results. A new chat starts with separate
+conversation context but can discover and edit the same current files. Files are
+not automatically cleared, restored, or versioned when switching chats.
+
+## Saved conversations
+
+The sidebar lets you create, select, continue, and delete chats. Chat titles come
+from the first prompt. Each turn shows its prompt, expandable chronological log
+(including QEMU captures), and Markdown answer. Failed/stopped turns keep their
+logs without inventing an answer. Only one run can be active across all chats.
+Switching chats keeps that run going; closing/reloading its browser stream stops
+it. Reopen the chat to read the saved output and send another message.
+
+History lives in `src/orchestration/data/conversations.db`, ignored by Git. ADK
+stores model messages and tool exchanges there; our ChatStore stores the sidebar,
+submitted prompts, visible logs, and final answers. It survives backend restarts.
+Previously running turns are marked interrupted after a restart. Interrupted tool
+requests are closed with an unknown-result message before continuing, rather than
+silently repeating a possible file write or build.
+
+SQLite is included with Python. `aiosqlite` in requirements.txt supplies ADK's async
+adapter; install it with the normal pip requirements command. No database server,
+Homebrew package, or database configuration is required. Back up the data directory
+with the backend stopped. Deleting a chat removes its conversation and logs, but
+keeps workspace files. Earlier runs made before this feature cannot be recovered.
+History grows with messages, source code/tool results, and logs; there is no
+automatic retention or context compaction yet. Long conversations also send more
+context to Gemini and may use more tokens.
+
+API endpoints:
+
+- `GET /chats`: sidebar list and the current active run, if any.
+- `POST /chats`: create an empty chat; returns its `id`.
+- `GET /chats/{id}`: saved turns, logs, and answers.
+- `DELETE /chats/{id}`: delete history, keeping files; stop its active run first.
+- Both task endpoints accept `{"task":"...", "chat_id":"..."}`. Reuse the returned
+  chat ID for follow-ups. Omitting it creates a new saved chat for compatibility
+  with existing curl commands. `session_id` is the chat ID; `run_id` identifies
+  one turn.
+
+Artifact IDs are local to a turn. To run a previous project's firmware in a later
+message, ask the agent to compile that project again before calling run_qemu or
+flash_firmware. The agent is instructed to inspect current files, since another
+chat may have edited them.
 
 In main.py, EnvironmentToolset supplies existing ADK implementations. We select
 its three file tools and register them beside compile_firmware, run_qemu, and flash_firmware.
@@ -220,15 +262,16 @@ backend before retrying so the earlier run does not remain active.
    into tool descriptions Gemini can use.
 4. ADK's EnvironmentToolset supplies three local file tools in the shared workspace.
    An Agent gives Gemini instructions, those file tools, the real compile/QEMU tools,
-   and simulated flash tool. An InMemoryRunner creates
-   a fresh session and manages model/tool/model turns. A session holds this run's
-   conversation and tool results in RAM; no conversation is reused across tasks.
+   and simulated flash tool. A Runner creates
+   or loads a saved session and manages model/tool/model turns. A session holds
+   this chat's messages and tool results in SQLite and is reused for follow-ups.
 5. For the example prompt, Gemini is instructed to compile first and then pass the
    exact returned artifact ID to flash. Python does not preselect these calls.
    The flash stub rejects an unknown ID or a call before a build.
 6. The runner executes requested tools and feeds results back to Gemini. Our event
    loop collects tool calls/results and the final answer, excluding thought parts.
-7. FastAPI returns JSON; the runner is closed and its session is not persisted.
+7. FastAPI saves the answer and returns JSON; the runner closes while the session
+   and visible logs remain in SQLite. The stream endpoint delivers logs as they happen.
 
 The runner allows at most eight model calls per task. Tool selection and wording
 are model-driven, so inspect tool_events to see what actually happened. HTTP 200
@@ -247,7 +290,7 @@ operations. Its unresolved interfaces are documented in src/runner/README.md.
 
 ```sh
 python -m pip install -r src/orchestration/requirements-dev.txt
-python -m unittest src.orchestration.test_api src.orchestration.test_qemu src.orchestration.test_stream
+python -m unittest src.orchestration.test_api src.orchestration.test_qemu src.orchestration.test_history src.orchestration.test_stream
 ```
 
 Tests replace the model transport. Most mock the build stage to test ADK plumbing;
@@ -255,8 +298,8 @@ integration tests use the installed ARM compiler and are skipped if it is absent
 They verify real binary creation and metadata, compiler-error feedback and repair,
 QEMU UART feedback reaching the model, bounded process cleanup (including cancellation),
 early errors and bounded output buffers,
-missing tools, invalidation after a failed rebuild, artifact handoff, fresh
-sessions, real file write/read/edit and persistence, workspace path rejection,
+missing tools, invalidation after a failed rebuild, artifact handoff, separate chats and reused
+sessions after restart, saved logs/errors, chat deletion without deleting files, real file write/read/edit and persistence, workspace path rejection,
 shell-tool exclusion, thought filtering, request validation, and error responses. They do not
 verify Gemini connectivity, credentials, quota, or real model tool selection.
 
@@ -281,8 +324,9 @@ workspace is released, so Stop may briefly wait. The log explains this wait.
 
 Both task endpoints share one active-run limit per backend process. A second run
 returns 409 rather than editing the shared files concurrently. Use a single
-Uvicorn worker for this local MVP. Sessions and logs are not persisted or resumable.
-The existing POST /tasks still returns its original complete JSON result.
+Uvicorn worker for this local MVP. Sessions, prompts, answers, and logs persist
+in SQLite. A stopped run is not automatically resumed; send a follow-up in its chat.
+The existing POST /tasks still returns its complete JSON result.
 
 The HTTP streaming tests bind a temporary loopback port and verify events arriving
 before completion, conflict rejection, Stop cleanup, and cancellation on disconnect.

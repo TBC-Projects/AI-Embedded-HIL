@@ -17,7 +17,9 @@ from fastapi.responses import StreamingResponse
 from google.adk.agents import Agent
 from google.adk.agents.run_config import RunConfig
 from google.adk.environment import LocalEnvironment
-from google.adk.runners import InMemoryRunner
+from google.adk.events import Event
+from google.adk.runners import Runner
+from google.adk.sessions.sqlite_session_service import SqliteSessionService
 from google.adk.tools.environment import EnvironmentToolset
 from google.genai import types
 from google.genai.errors import APIError
@@ -25,6 +27,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from . import compiler as firmware_build
 from . import qemu as firmware_qemu
+from .history import ChatStore
 
 # This demo uses the Gemini API with GOOGLE_API_KEY, rather than Vertex AI.
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "FALSE"
@@ -38,8 +41,24 @@ APP_NAME = "firmware_mvp"
 PROGRESS_INTERVAL_SECONDS = 10
 WORKSPACE_ROOT = Path(__file__).resolve().parent / "workspaces"
 BUILD_SUPPORT_DIR = Path(__file__).resolve().parent / "firmware"
+DATA_DIR = Path(__file__).resolve().parent / "data"
+chat_store: ChatStore | None = None
 active_run: asyncio.Task | None = None
 active_run_id: str | None = None
+active_chat_id: str | None = None
+
+
+def get_store() -> ChatStore:
+    global chat_store
+    path = DATA_DIR / "conversations.db"
+    if chat_store is None or chat_store.path != path:
+        chat_store = ChatStore(path)
+        chat_store.recover_interrupted()
+    return chat_store
+
+
+def session_service() -> SqliteSessionService:
+    return SqliteSessionService(db_path=str(get_store().path))
 
 
 def redact(text: str) -> str:
@@ -64,18 +83,52 @@ def error_detail(error: Exception) -> str:
 
 def start_run(request, run_id, emit=None):
     """One active run per backend process, including cleanup after cancellation."""
-    global active_run, active_run_id
+    global active_run, active_run_id, active_chat_id
     if not os.environ.get("GOOGLE_API_KEY", "").strip():
         raise HTTPException(status_code=503, detail="Set GOOGLE_API_KEY before submitting a task.")
     if active_run is not None and not active_run.done():
         raise HTTPException(status_code=409, detail="Another run is active. Stop it or wait for it to finish.")
+    store = get_store()
+    chat_id = str(request.chat_id) if request.chat_id else store.create_chat()["id"]
+    if store.get_chat(chat_id) is None:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    request = request.model_copy(update={"chat_id": UUID(chat_id), "task": redact(request.task)})
+    store.start_run(chat_id, run_id, request.task)
+
+    def record(event):
+        event = json.loads(redact(json.dumps({**event, "chat_id": chat_id})))
+        saved = store.append_log(event)
+        if emit:
+            emit(saved)
+
+    async def execute():
+        try:
+            result = await run_agent_loop(request, emit=record, run_id=run_id)
+            result = json.loads(redact(json.dumps({**result, "chat_id": chat_id, "run_id": run_id})))
+            store.finish_run(run_id, "completed", result)
+            return result
+        except asyncio.CancelledError:
+            record({"type": "log", "run_id": run_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(), "source": "Backend",
+                    "message": "Run stopped; resources released."})
+            store.finish_run(run_id, "stopped")
+            raise
+        except Exception as error:
+            record({"type": "log", "run_id": run_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(), "source": "Error",
+                    "message": error_detail(error)})
+            store.finish_run(run_id, "failed")
+            raise
+
     active_run_id = run_id
-    active_run = asyncio.create_task(run_agent_loop(request, emit=emit, run_id=run_id))
+    active_chat_id = chat_id
+    active_run = asyncio.create_task(execute())
     return active_run
 
 
 class TaskRequest(BaseModel):
     task: str = Field(min_length=1, max_length=10000)
+    chat_id: UUID | None = None
 
     @field_validator("task")
     @classmethod
@@ -88,6 +141,37 @@ class TaskRequest(BaseModel):
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/chats")
+async def list_chats():
+    return {"chats": get_store().list_chats(),
+            "active_run": {"run_id": active_run_id, "chat_id": active_chat_id}
+            if active_run is not None and not active_run.done() else None}
+
+
+@app.post("/chats", status_code=201)
+async def create_chat():
+    return {**get_store().create_chat(), "runs": []}
+
+
+@app.get("/chats/{chat_id}")
+async def get_chat(chat_id: UUID):
+    chat = get_store().get_chat(str(chat_id))
+    if chat is None:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return chat
+
+
+@app.delete("/chats/{chat_id}")
+async def delete_chat(chat_id: UUID):
+    if str(chat_id) == active_chat_id and active_run is not None and not active_run.done():
+        raise HTTPException(status_code=409, detail="Stop this conversation's run before deleting it.")
+    if get_store().get_chat(str(chat_id)) is None:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    await session_service().delete_session(app_name=APP_NAME, user_id="local_user", session_id=str(chat_id))
+    get_store().delete_chat(str(chat_id))
+    return {"message": "Conversation deleted. Workspace files were kept."}
 
 
 @app.post("/tasks")
@@ -114,13 +198,9 @@ async def stream_task(request: TaskRequest, run_id: UUID):
             result = await task
             queue.put_nowait({"type": "final", "run_id": run_id, "result": result})
         except asyncio.CancelledError:
-            queue.put_nowait({"type": "log", "run_id": run_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "source": "Backend", "message": "Run stopped; resources released."})
-        except Exception as error:
-            queue.put_nowait({"type": "log", "run_id": run_id,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "source": "Error", "message": error_detail(error)})
+            pass  # execute() has already saved and emitted the cancellation log.
+        except Exception:
+            pass  # execute() has already saved and emitted the error log.
         finally:
             queue.put_nowait(None)
 
@@ -155,7 +235,7 @@ async def stop_task(run_id: UUID):
 
 
 async def run_agent_loop(task: TaskRequest, emit=None, run_id=None) -> dict:
-    """Let ADK handle model -> tool -> model turns for one fresh session."""
+    """Run one turn using this chat's saved ADK session and the shared files."""
     run_id = run_id or uuid4().hex
     started = monotonic()
     phase = "setting up the agent"
@@ -352,7 +432,10 @@ async def run_agent_loop(task: TaskRequest, emit=None, run_id=None) -> dict:
         instruction=(
             "You generate and compile bare-metal C firmware for Raspberry Pi Zero W. "
             f"Your local workspace is {workspace}. "
-            "Files persist across tasks. Read existing files before revising them. "
+            "Files persist across tasks and ALL conversations in one shared workspace. "
+            "An older conversation may describe files that have since changed; read "
+            "the current files before revising them. Artifact IDs are valid only in "
+            "the current turn: recompile before QEMU/flash in a follow-up. "
             "Use list_directory('.') to discover existing projects, then list their "
             "subdirectories and read relevant source files. Directory listings are "
             "one level at a time; returned paths are relative to the workspace. "
@@ -391,17 +474,43 @@ async def run_agent_loop(task: TaskRequest, emit=None, run_id=None) -> dict:
         before_model_callback=before_model,
         after_model_callback=after_model,
     )
-    runner = InMemoryRunner(agent=agent, app_name=APP_NAME)
+    service = session_service()
+    runner = Runner(agent=agent, app_name=APP_NAME, session_service=service)
     tool_events = []
     final_response = ""
     heartbeat = asyncio.create_task(report_waiting(), name=f"firmware-progress-{run_id}")
     try:
-        phase = "creating the in-memory session"
-        log("Creating fresh in-memory session.")
-        session = await runner.session_service.create_session(
-            app_name=APP_NAME, user_id="local_user", session_id=run_id,
-        )
-        log("Session created. Starting ADK runtime.")
+        phase = "loading the saved conversation session"
+        conversation_id = str(task.chat_id) if task.chat_id else run_id
+        session = await service.get_session(
+            app_name=APP_NAME, user_id="local_user", session_id=conversation_id)
+        if session is None:
+            log("Creating saved conversation session.")
+            session = await service.create_session(
+                app_name=APP_NAME, user_id="local_user", session_id=conversation_id)
+        else:
+            log("Loaded saved conversation history.")
+            # A stopped turn may have saved a tool request without its result.
+            # Close that request honestly so the next Gemini call has a complete
+            # tool exchange. Never rerun a cancelled operation automatically.
+            pending = {}
+            for previous in session.events:
+                for call in previous.get_function_calls():
+                    pending[call.id] = (call, previous.invocation_id)
+                for response in previous.get_function_responses():
+                    pending.pop(response.id, None)
+            for call, invocation_id in pending.values():
+                await service.append_event(session, Event(
+                    author="firmware_agent", invocation_id=invocation_id,
+                    content=types.Content(role="user", parts=[types.Part(
+                        function_response=types.FunctionResponse(id=call.id, name=call.name,
+                            response={"status": "interrupted", "message":
+                                      "This tool call was interrupted. Its result is unknown. Inspect current files and recompile before running firmware."}),
+                    )]),
+                ))
+            if pending:
+                log("Recorded interrupted tool calls before continuing the conversation.")
+        log("Starting ADK runtime.")
         message = types.Content(role="user", parts=[types.Part(text=task.task)])
 
         # ADK calls Gemini, executes the Python tools it requests, and sends their
@@ -460,7 +569,7 @@ async def run_agent_loop(task: TaskRequest, emit=None, run_id=None) -> dict:
         heartbeat.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat
-        # The session exists only in this runner's RAM and is not persisted.
+        # The runner closes after this turn; its session remains in SQLite.
         log("Closing runner and releasing in-memory resources.")
         try:
             await runner.close()

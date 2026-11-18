@@ -6,11 +6,13 @@ The dashboard is a React/TypeScript/Vite page connected to the backend with an
 HTTP stream. It submits a prompt and displays a chronological activity log with
 inline QEMU UART captures and a final answer. There are no mock stages or test
 verdicts. FastAPI exposes health and task endpoints using one Google ADK Agent with
-Gemini and an InMemoryRunner. Each task creates a fresh session. The compile tool
+Gemini and a Runner. Each chat reuses a SQLite session across turns and restarts. The compile tool
 calls the bundled `src/orchestration/compiler.py` helper with templates from
 `src/orchestration/firmware/`; flashing remains simulated. Built-in ADK file tools
 can write, read, and edit real source files in one shared persistent workspace
-(`src/orchestration/workspaces/`). Conversation sessions remain separate per request.
+(`src/orchestration/workspaces/`). Chat contexts remain separate while all chats share files. Chat list, prompts,
+answers, and visible logs are saved alongside ADK sessions in
+`src/orchestration/data/conversations.db`. Deleting a chat keeps workspace files.
 The backend calls Gemini and can produce real ELF/binary artifacts, but no hardware
 is accessed. There is no hardware runner service. One run is allowed per backend
 process; Stop and stream disconnects cancel the run and clean up its resources.

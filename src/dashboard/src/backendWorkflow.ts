@@ -1,4 +1,4 @@
-import type { StreamEvent } from './workflow';
+import type { ActiveRun, ChatSummary, Conversation, StreamEvent } from './workflow';
 
 // HTTP chunks can split a JSON line or even a UTF-8 character anywhere.
 export async function readEvents(
@@ -38,10 +38,11 @@ export async function streamTask(
   runId: string,
   onEvent: (event: StreamEvent) => void,
   signal: AbortSignal,
+  chatId?: string,
 ): Promise<void> {
   const response = await fetch(`/api/tasks/stream?run_id=${encodeURIComponent(runId)}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ task }), signal,
+    body: JSON.stringify({ task, ...(chatId ? { chat_id: chatId } : {}) }), signal,
   });
   await requireSuccess(response);
   if (!response.body) throw new Error('The backend returned no log stream.');
@@ -53,4 +54,27 @@ export async function stopTask(runId: string): Promise<boolean> {
   // The run can finish naturally just before Stop reaches the server.
   if (response.status !== 404) await requireSuccess(response);
   return response.status !== 404;
+}
+
+export async function listChats(): Promise<{ chats: ChatSummary[]; active_run: ActiveRun | null }> {
+  const response = await fetch('/api/chats');
+  await requireSuccess(response);
+  return response.json();
+}
+
+export async function createChat(): Promise<Conversation> {
+  const response = await fetch('/api/chats', { method: 'POST' });
+  await requireSuccess(response);
+  return response.json();
+}
+
+export async function getChat(id: string): Promise<Conversation> {
+  const response = await fetch(`/api/chats/${encodeURIComponent(id)}`);
+  await requireSuccess(response);
+  return response.json();
+}
+
+export async function deleteChat(id: string): Promise<void> {
+  const response = await fetch(`/api/chats/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  await requireSuccess(response);
 }

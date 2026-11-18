@@ -101,6 +101,9 @@ class ApiTests(unittest.TestCase):
         root_patch = patch("src.orchestration.main.WORKSPACE_ROOT", self.workspace_root)
         root_patch.start()
         self.addCleanup(root_patch.stop)
+        data_patch = patch("src.orchestration.main.DATA_DIR", self.workspace_root.parent / "data")
+        data_patch.start()
+        self.addCleanup(data_patch.stop)
         self.real_build = firmware_build.run
 
         def test_build(project):
@@ -450,6 +453,9 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         root_patch = patch("src.orchestration.main.WORKSPACE_ROOT", Path(temporary.name))
         root_patch.start()
         self.addCleanup(root_patch.stop)
+        data_patch = patch("src.orchestration.main.DATA_DIR", Path(temporary.name) / "data")
+        data_patch.start()
+        self.addCleanup(data_patch.stop)
 
     async def test_waiting_logs_model_turns_and_cleans_up(self):
         transport = fake_model()
@@ -466,7 +472,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
             result = await run_agent_loop(TaskRequest(task="Compile and flash"))
 
         text = output.getvalue()
-        self.assertIn("Creating fresh in-memory session", text)
+        self.assertIn("Creating saved conversation session", text)
         self.assertIn("Still active; current stage: waiting for Gemini response #1", text)
         self.assertIn("Received Gemini response for model call #3", text)
         self.assertIn("Agent run completed", text)
