@@ -273,7 +273,7 @@ backend before retrying so the earlier run does not remain active.
 7. FastAPI saves the answer and returns JSON; the runner closes while the session
    and visible logs remain in SQLite. The stream endpoint delivers logs as they happen.
 
-The runner allows at most eight model calls per task. Tool selection and wording
+The runner allows at most 30 model calls per task. Tool selection and wording
 are model-driven, so inspect tool_events to see what actually happened. HTTP 200
 means an answer was returned, not that real firmware was tested. Missing API key
 returns 503; invalid task input returns 422; an unsuccessful Gemini/ADK run returns

@@ -519,7 +519,7 @@ async def run_agent_loop(task: TaskRequest, emit=None, run_id=None) -> dict:
             user_id=session.user_id,
             session_id=session.id,
             new_message=message,
-            run_config=RunConfig(max_llm_calls=8),
+            run_config=RunConfig(max_llm_calls=30),
         ):
             for call in event.get_function_calls():
                 entry = {"type": "tool_call", "name": call.name, "arguments": call.args}
