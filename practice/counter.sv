@@ -33,7 +33,7 @@ module counter (
                 btnU_prev <= 1'b1;
             end
 
-            if ((btnD & ~btnU & ~btnD_prev) & counter != 0) begin
+            if ((btnD & ~btnU & ~btnD_prev) && (counter != 0)) begin
                 counter <= counter - 1;
                 btnD_prev <= 1'b1;
             end
@@ -58,7 +58,7 @@ module counter (
             4: seg <= 7'b0011001; // 4
             5: seg <= 7'b0010010; // 5
             6: seg <= 7'b0000010; // 6
-            7: seg <= 7'b0000111; // 7 
+            7: seg <= 7'b1111000; // 7 
             8: seg <= 7'b0000000; // 8
             9: seg <= 7'b0010000; // 9
             default: seg <= 7'b1111111; // nothing
@@ -66,8 +66,6 @@ module counter (
     end
 
     // run something that sets the segments to the given counter?
-<<<<<<< Updated upstream
-=======
 endmodule
 
 module counter_testbench();
@@ -75,7 +73,7 @@ module counter_testbench();
     logic clk;
     logic btnU, btnC, btnD, btnL, btnR;
     logic [15:0] sw;
-    logic rst;
+    logic rst_n;
 
     logic [15:0] led;
     logic [3:0] an;
@@ -86,19 +84,18 @@ module counter_testbench();
     counter dut (.*);
 
     initial clk = 0;
-    always #5 clk = ~clk
+    always #5 clk = ~clk;
 
      initial begin
-        rst = 1;
         btnU = 0;
         btnD = 0;
-        btnC = 0;
+        btnC = 1;
         btnL = 0;
         btnR = 0;
         sw = 0;
 
         #12;
-        rst = 0;
+        btnC = 0;
 
         // Press Up button
         #10;
@@ -132,8 +129,7 @@ module counter_testbench();
     // Display counter values
     initial begin
         $monitor("Time=%0t Counter=%0d Up=%b Down=%b Reset=%b",
-                 $time, dut.counter, btnU, btnD, rst);
+                 $time, dut.counter, btnU, btnD, btnC);
     end
 
->>>>>>> Stashed changes
 endmodule

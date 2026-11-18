@@ -84,12 +84,27 @@ The full details are at the top of `runner.py`. In short:
   - `A` arms it and `S` stops it. The FPGA answers each with `K`.
   - `D` dumps the recorded edges as 8-byte records: a timestamp in 10 ns ticks, the pin levels, and which pins changed.
 
-## Common changes
+## Getting started (new members)
 
-- **Ban another C pattern:** add a `(regex, reason)` pair to `FORBIDDEN` in `harness.py`.
-- **Change compiler flags:** edit `CFLAGS` in `build.py`.
-- **Change timeouts:** see `TIMEOUT_S` in `qemu_gate.py`, `run_timeout_s` in `runner.py`, and the constants at the top of `runner.py`.
-- **Add a stage:** write a `run(...)` function that returns a `StageResult`, then add it to the `stages` list in `pipeline.py`.
+Each stage file (`harness.py`, `build.py`, `qemu_gate.py`, `runner.py`, `pipeline.py`) starts with a long comment. It explains the background, what to build, suggested steps, and how to check your work. The code underneath is empty on purpose: you write it.
+
+Recommended order:
+
+| Order | Deliverable | File | You'll learn | Hardware needed |
+|---|---|---|---|---|
+| 1 | D1 Harness | `harness.py` | strings, regex, files | none |
+| 2 | D2 Build | `build.py` | running programs from Python, cross-compiling | none |
+| 3 | D3 QEMU gate | `qemu_gate.py` | emulators, reading a running process | none |
+| 4 | D4 Runner (pairs) | `runner.py` | serial ports, binary protocols | none (uses fakes in `tests/fake_rig.py`) |
+| 5 | D8 Pipeline | `pipeline.py` | putting it together | optional |
+
+Steps:
+1. Read `common.py` first. It's short, and every stage uses it.
+2. Open your deliverable's file and read the whole top comment before writing any code.
+3. Try the "by hand" commands in the comment, if there are any.
+4. Run only your own tests while you work, e.g. `python3 -m pytest tests/test_harness.py -v`.
+   They fail with `NotImplementedError: TODO` until you write the code; that's expected.
+5. Don't edit the files in `tests/`. They're how we know a deliverable is done.
 
 ## Still to write
 

@@ -43,8 +43,13 @@ This report serves two primary functions:
 ## Local MVP
 
 The current implementation is a browser-local demonstration plus an independent
-FastAPI skeleton. It does not call a model, compile firmware, upload binaries, or
-access hardware. No authentication, database, or deployment is included.
+FastAPI endpoint using Google ADK and Gemini with local file tools, real ARM
+compilation through `src/build/build.py`, and simulated flashing. The agent can
+save and revise real source files in the shared
+`src/orchestration/workspaces/` directory across requests. Each conversation starts
+fresh. Builds require the ARM toolchain described in the orchestration README.
+The backend does not upload binaries or access hardware. No authentication,
+database, or deployment is included.
 
 Frontend (Node.js 22.14+):
 
@@ -65,11 +70,17 @@ Backend (Python 3.10+, from the repository root):
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r src/orchestration/requirements.txt
+export GOOGLE_API_KEY='your-Google-AI-Studio-API-key'
 python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-`GET /health` returns 200. Valid `POST /tasks` requests return 501 because agent
-execution is not implemented. The frontend does not need this server running.
+`GET /health` returns 200. `POST /tasks` sends the prompt to a Gemini agent with
+local file tools, a real compile tool, and simulated flashing. It returns the workspace path,
+answer, and tool transcript. See the [file generation example](src/orchestration/README.md#generate-a-real-local-file) and
+[test prompts and long-wait notes](src/orchestration/README.md#long-waits-and-test-prompts)
+before testing: some runs have waited a long time for a final model response, and
+there is no overall backend timeout. The frontend remains independent and does
+not need this server running.
 
 | Directory | Responsibility and integration point |
 | --- | --- |
