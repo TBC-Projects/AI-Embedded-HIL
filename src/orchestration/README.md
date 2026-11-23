@@ -9,7 +9,9 @@ its UART output to Gemini. The dashboard streams real backend activity and inlin
 
 ## Run locally
 
-From the repository root, create a virtual environment (Python 3.11+ recommended):
+From the repository root, create a virtual environment (Python 3.11+ recommended).
+
+macOS / Linux:
 
 ```sh
 python3 -m venv .venv
@@ -18,6 +20,19 @@ source .venv/bin/activate
 export GOOGLE_API_KEY='your-Google-AI-Studio-API-key'
 ./.venv/bin/python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
 ```
+
+Windows (PowerShell):
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r src\orchestration\requirements.txt
+$env:GOOGLE_API_KEY = "your-Google-AI-Studio-API-key"
+.\.venv\Scripts\python.exe -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+On Windows, `Activate.ps1` may be blocked by the execution policy, so call
+`.\.venv\Scripts\python.exe` directly; use `curl.exe` or `Invoke-RestMethod`
+where the examples below say `curl`.
 
 Get a key from https://aistudio.google.com/apikey. Keep it outside Git. The backend
 reads GOOGLE_API_KEY; this demo explicitly uses the Gemini API rather than Vertex
@@ -138,6 +153,7 @@ Install both ARM tools if needed (no additional Python dependency is required):
 # macOS
 brew install --cask gcc-arm-embedded
 # Ubuntu: sudo apt install gcc-arm-none-eabi
+# Windows: winget install --id Arm.GnuArmEmbeddedToolchain -e
 arm-none-eabi-gcc --version
 arm-none-eabi-objcopy --version
 ```
@@ -193,8 +209,17 @@ LocalEnvironment is a local development tool, not an OS sandbox.
 
 ## Observe firmware in QEMU
 
-Install QEMU if needed: `brew install qemu` on macOS, or
-`sudo apt install qemu-system-arm` on Ubuntu. No extra Python dependency is needed.
+Install QEMU if needed: `brew install qemu` on macOS,
+`sudo apt install qemu-system-arm` on Ubuntu, or
+`winget install SoftwareFreedomConservancy.QEMU` on Windows (or the installer
+from https://qemu.weilnetz.de/w64/). Make sure `qemu-system-arm` is on PATH;
+`QEMU_PATH` can point at the executable instead. No extra Python dependency is
+needed.
+
+On Windows, `uvicorn --reload` runs the app on the Selector event loop, which
+cannot create subprocesses. Observation falls back to a background thread in
+that case, so `run_qemu` works with or without `--reload`; the returned fields
+are identical.
 
 Restart the backend, then in another terminal:
 

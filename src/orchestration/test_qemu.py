@@ -1,9 +1,11 @@
 """Bounded capture/cleanup tests. Real child processes; no Gemini needed."""
 
 import asyncio
+import os
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +20,9 @@ class QemuObservationTests(unittest.IsolatedAsyncioTestCase):
         self.elf.write_bytes(b"test")
         self.children = []
         self.spawn = asyncio.create_subprocess_exec
+        env = patch.dict(os.environ, {"QEMU_PATH": ""})
+        env.start()
+        self.addCleanup(env.stop)
 
     async def launch_child(self, script, **kwargs):
         child = await self.spawn(sys.executable, "-u", "-c", script, **kwargs)
@@ -33,7 +38,7 @@ class QemuObservationTests(unittest.IsolatedAsyncioTestCase):
                 **kwargs,
             )
         with patch.object(qemu.asyncio, "create_subprocess_exec", spawn):
-            result = await qemu.observe(self.elf, 0.3)
+            result = await qemu.observe(self.elf, 2.0)
         self.assertEqual(result["uart_output"], "Hello")
         self.assertIn("diagnostic", result["qemu_errors"])
         self.assertEqual(result["stopped_by"], "observation_limit")
@@ -46,7 +51,7 @@ class QemuObservationTests(unittest.IsolatedAsyncioTestCase):
                 'import sys; print("bad ELF", file=sys.stderr); sys.exit(1)', **kwargs,
             )
         with patch.object(qemu.asyncio, "create_subprocess_exec", spawn):
-            result = await qemu.observe(self.elf)
+            result = await qemu.observe(self.elf, 2.0)
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["execution_status"], "process_exited")
         self.assertEqual(result["exit_code"], 1)
@@ -59,7 +64,7 @@ class QemuObservationTests(unittest.IsolatedAsyncioTestCase):
                 'sys.stderr.write("B"*100000); sys.stderr.flush(); time.sleep(60)', **kwargs,
             )
         with patch.object(qemu.asyncio, "create_subprocess_exec", spawn), patch.object(qemu, "MAX_OUTPUT_BYTES", 128):
-            result = await qemu.observe(self.elf, 0.3)
+            result = await qemu.observe(self.elf, 2.0)
         self.assertEqual(result["uart_output"], "A" * 128)
         self.assertEqual(result["qemu_errors"], "B" * 128)
         self.assertTrue(result["uart_truncated"])
@@ -90,3 +95,43 @@ class QemuObservationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(qemu, "QEMU", "missing-qemu-for-test"):
             result = await qemu.observe(self.elf)
         self.assertEqual(result["execution_status"], "infrastructure_error")
+
+    # --- Windows fallback (Selector event loop has no subprocess support) ---
+
+    def test_threaded_capture_reads_both_streams_and_stops_child(self):
+        argv = [sys.executable, "-u", "-c",
+                'import sys,time; print("Hello", end="", flush=True); '
+                'print("diagnostic", file=sys.stderr, flush=True); time.sleep(60)']
+        uart, errors, uart_truncated, errors_truncated, stopped, code = (
+            qemu._capture_threaded(argv, 2.0, threading.Event()))
+        self.assertEqual(uart, "Hello")
+        self.assertIn("diagnostic", errors)
+        self.assertFalse(uart_truncated)
+        self.assertFalse(errors_truncated)
+        self.assertTrue(stopped)
+        self.assertIsNotNone(code)
+
+    async def test_falls_back_to_threads_when_loop_cannot_spawn(self):
+        seen = {}
+
+        async def no_subprocess(*args, **kwargs):
+            raise NotImplementedError
+
+        def fake_capture(argv, duration, stop):
+            seen["argv"] = argv
+            return "HIL:BOOT\n", "", False, False, True, None
+
+        with patch.object(qemu.asyncio, "create_subprocess_exec", no_subprocess), \
+                patch.object(qemu, "_capture_threaded", fake_capture):
+            result = await qemu.observe(self.elf, 0.2)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["uart_output"], "HIL:BOOT\n")
+        self.assertEqual(result["stopped_by"], "observation_limit")
+        self.assertEqual(seen["argv"][0], qemu.QEMU)
+
+    async def test_missing_qemu_suggests_qemu_path(self):
+        with patch.object(qemu, "QEMU", "missing-qemu-for-test"):
+            result = await qemu.observe(self.elf)
+        self.assertEqual(result["execution_status"], "infrastructure_error")
+        self.assertIn("missing-qemu-for-test", result["message"])
+        self.assertIn("QEMU_PATH", result["message"])

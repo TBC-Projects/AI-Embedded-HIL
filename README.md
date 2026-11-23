@@ -65,7 +65,9 @@ your message to the real agent in the selected chat. The sidebar selects saved
 conversations; each turn keeps its chronological backend/QEMU log and Markdown answer. Stop
 cancels backend work and waits for cleanup. Only one run can be active at a time.
 
-Backend (Python 3.10+, from the repository root):
+Backend (Python 3.10+, from the repository root).
+
+macOS / Linux:
 
 ```sh
 python3 -m venv .venv
@@ -74,6 +76,19 @@ source .venv/bin/activate
 export GOOGLE_API_KEY='your-Google-AI-Studio-API-key'
 ./.venv/bin/python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
 ```
+
+Windows (PowerShell):
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r src\orchestration\requirements.txt
+$env:GOOGLE_API_KEY = "your-Google-AI-Studio-API-key"
+.\.venv\Scripts\python.exe -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+On Windows, `Activate.ps1` may be blocked by the execution policy, so the block
+above calls `.\.venv\Scripts\python.exe` directly; `curl` is an alias for
+`Invoke-WebRequest`, so use `curl.exe` or `Invoke-RestMethod`.
 
 `GET /health` returns 200. `POST /tasks` sends the prompt to a Gemini agent with
 local file tools, real compile and bounded QEMU tools, and simulated flashing. It returns the workspace path,
