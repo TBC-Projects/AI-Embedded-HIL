@@ -15,12 +15,17 @@ From the repository root, create a virtual environment (Python 3.11+ recommended
 python3 -m venv .venv
 source .venv/bin/activate
 ./.venv/bin/python -m pip install -r src/orchestration/requirements.txt
-export GOOGLE_API_KEY='your-Google-AI-Studio-API-key'
+cp .env.example .env          # once; then put your key in .env (see below)
 ./.venv/bin/python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Get a key from https://aistudio.google.com/apikey. Keep it outside Git. The backend
-reads GOOGLE_API_KEY; this demo explicitly uses the Gemini API rather than Vertex
+Get a key from https://aistudio.google.com/apikey and put it in `.env` at the
+repository root, after `GOOGLE_API_KEY=` (no quotes or spaces). `.env` is
+git-ignored, so the key stays on your computer; never put a real key in
+`.env.example`, which is committed. The server loads `.env` when it starts, so
+restart it after changing the key. A key set in the terminal
+(`export GOOGLE_API_KEY=...`) takes priority over `.env`. The backend reads
+GOOGLE_API_KEY; this demo explicitly uses the Gemini API rather than Vertex
 AI. Model: `gemini-3.8-flash` (the `MODEL` constant in main.py, without a `models/`
 prefix because ADK resolves bare Gemini IDs). Actual model calls
 require model access, available quota, and network connectivity.
@@ -96,7 +101,7 @@ qemu-system-arm --version     # 6.2 or newer
 The agent's tools run in this order, passing the same `artifact_id` along:
 
 ```
-compile_firmware(project_dir) -> test_firmware(artifact_id) -> flash_firmware(artifact_id)
+compile_firmware(project_dir) -> test_firmware(artifact_id, expect_output) -> flash_firmware(artifact_id)
    harness + build (real)          QEMU (real)                     simulated
 ```
 
@@ -107,7 +112,7 @@ compile_firmware runs two stages and stops at the first failure. The result's
 |---|---|---|
 | compile: `harness` | `src/build/harness.py` rules: only `src/<name>.c`/`.h`, no libc headers, no `printf`/`malloc`/`free`/`sprintf`, no startup symbols, `int main(void)` present | `#include <stdio.h>` (code) |
 | compile: `build` | `src/build/build.py`: arm-none-eabi-gcc + objcopy | syntax error (code); toolchain missing (rig) |
-| `test_firmware` | `src/build/qemu_gate.py`: boots the build with `qemu-system-arm -M raspi0`; the program must print `HIL:DONE` | hang, crash before `main`, `hil_panic` (code); QEMU missing (rig) |
+| `test_firmware` | `src/build/qemu_gate.py`: runs the build in `qemu-system-arm -M raspi0` for 5 s; it must boot and keep running without `hil_panic` (and print `expect_output`, if given) | `hil_panic`, crash before `main`, QEMU exits, `expect_output` never printed (code); QEMU missing (rig) |
 
 The harness reads its usual `=== FILE src/<name> ===` text, so the project's `src/`
 files are packed into that format and checked in a temporary folder; the agent's
@@ -123,10 +128,28 @@ build-demo/
   kernel.elf, kernel.bin, build.log    from compile_firmware
   test_firmware/
     kernel.elf          copy of the build that was tested
-    qemu.log            QEMU console output (HIL:BOOT ... HIL:DONE)
+    qemu.log            QEMU console output (HIL:BOOT, then whatever the firmware prints)
 ```
 
 The result includes the console output (`console`) and the folder (`test_dir`).
+
+Firmware normally loops forever and never returns from `main`, so the QEMU test
+does not wait for the program to finish. It runs it for 5 seconds
+(`qemu_gate.TIMEOUT_S`) and decides:
+
+| What happens in QEMU | Result |
+|---|---|
+| `HIL:PANIC` | fail |
+| QEMU exits on its own | fail |
+| no `HIL:BOOT` (crashed before `main`) | fail |
+| `expect_output` given and printed | pass, right away |
+| `expect_output` given but not printed in 5 s | fail |
+| no `expect_output`: booted, no panic, still running after 5 s | pass ("still running") |
+| `HIL:DONE` (`main` returned; small test programs) | pass |
+
+A run-only pass just means it didn't crash. For a meaningful check, have the
+firmware print a status line (for example `hil_puts("UART ready\n")`) and pass
+that text as `expect_output`.
 
 For example, have the agent write `build-demo/src/main.c`, then call
 `compile_firmware(project_dir="build-demo")`. The directory must be inside the

@@ -81,7 +81,7 @@ def fake_file_model(operations):
         if name in ("test_firmware", "flash_firmware"):
             # test uses the latest successful build; flash uses the latest passing test.
             source = "compile_firmware" if name == "test_firmware" else "test_firmware"
-            args = {"artifact_id": next(
+            args = {**args, "artifact_id": next(
                 (result.response["artifact_id"] for result in reversed(results)
                  if result.name == source and result.response["status"] == "success"),
                 "no-successful-artifact",
@@ -405,7 +405,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(build["status"], "success", build)
         self.qemu_mock.assert_called_once()        # compile_firmware no longer runs QEMU itself
         test_dir = self.workspace_root.resolve() / "demo" / "test_firmware"
-        self.qemu_mock.assert_called_once_with(test_dir / "kernel.elf")
+        self.qemu_mock.assert_called_once_with(test_dir / "kernel.elf", expect=None)
         self.assertEqual(test["status"], "success", test)
         self.assertEqual(test["artifact_id"], build["artifact_id"])
         self.assertEqual(test["test_dir"], str(test_dir))
@@ -469,6 +469,65 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(results[1]["status"], "success", results[1])
         self.assertEqual(results[2]["status"], "success", results[2])
         self.assertIn("hello", results[2]["console"])
+
+    def test_expect_output_is_passed_to_qemu(self):
+        operations = [
+            ("WriteFile", {"path": "demo/src/main.c", "content": "int main(void) { for (;;) { } }\n"}),
+            ("compile_firmware", {"project_dir": "demo"}),
+            ("test_firmware", {"expect_output": "  UART ready  "}),
+        ]
+        with patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        test_dir = self.workspace_root.resolve() / "demo" / "test_firmware"
+        self.qemu_mock.assert_called_once_with(test_dir / "kernel.elf", expect="UART ready")
+
+    @unittest.skipUnless(
+        shutil.which(firmware_build.CC) and shutil.which(firmware_build.OBJCOPY) and shutil.which(firmware_qemu.QEMU),
+        "ARM toolchain and qemu-system-arm needed")
+    def test_real_endless_firmware_passes_and_can_be_flashed(self):
+        # Real firmware never returns from main. It must still pass and be flashable.
+        self.rules_mock.side_effect = self.real_rules
+        self.build_mock.side_effect = self.real_build
+        self.qemu_mock.side_effect = firmware_qemu.run
+        endless = '#include "hil.h"\nint main(void) {\n    hil_puts("UART ready\\n");\n    for (;;) { }\n}\n'
+        operations = [
+            ("WriteFile", {"path": "demo/src/main.c", "content": endless}),
+            ("compile_firmware", {"project_dir": "demo"}),
+            ("test_firmware", {}),                                  # run-only check
+            ("test_firmware", {"expect_output": "UART ready"}),    # output check
+            ("test_firmware", {"expect_output": "never printed"}), # must fail
+        ]
+        with patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
+        self.assertEqual(results[1]["status"], "success", results[1])
+        self.assertEqual(results[2]["status"], "success", results[2])
+        self.assertIn("still running", results[2]["summary"])
+        self.assertEqual(results[3]["status"], "success", results[3])
+        self.assertIn("UART ready", results[3]["console"])
+        self.assertEqual(results[4]["status"], "error")
+        self.assertEqual(results[4]["blame"], "code")
+        self.assertIn("did not print 'never printed'", results[4]["summary"])
+
+    @unittest.skipUnless(
+        shutil.which(firmware_build.CC) and shutil.which(firmware_build.OBJCOPY) and shutil.which(firmware_qemu.QEMU),
+        "ARM toolchain and qemu-system-arm needed")
+    def test_real_endless_firmware_full_flow_to_flash(self):
+        self.rules_mock.side_effect = self.real_rules
+        self.build_mock.side_effect = self.real_build
+        self.qemu_mock.side_effect = firmware_qemu.run
+        endless = '#include "hil.h"\nint main(void) {\n    for (;;) { strobe_pulse(0); }\n}\n'
+        operations = [
+            ("WriteFile", {"path": "demo/src/main.c", "content": endless}),
+            ("compile_firmware", {"project_dir": "demo"}),
+            ("test_firmware", {}),
+            ("flash_firmware", {}),
+        ]
+        with patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
+        self.assertEqual([result["status"] for result in results], ["ok", "success", "success", "success"], results)
 
 
 class ProgressTests(unittest.IsolatedAsyncioTestCase):
