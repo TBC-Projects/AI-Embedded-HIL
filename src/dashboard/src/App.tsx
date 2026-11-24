@@ -1,96 +1,221 @@
-import { useEffect, useRef, useState } from 'react';
-import { createMockWorkflow } from './mockWorkflow';
-import type { ExecutionStatus, Stage, Workflow, WorkflowEvent, WorkflowResult } from './workflow';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import Markdown from 'react-markdown';
+import { createChat, deleteChat, getChat, listChats, stopTask, streamTask } from './backendWorkflow';
+import { mergeConversation } from './chatState';
+import type { ActiveRun, ChatSummary, Conversation, LogEntry } from './workflow';
 
-const defaultWorkflow = createMockWorkflow();
-const stages = ['Editing', 'Compiling', 'Waiting for device', 'Testing', 'Finished'];
+const example = 'Create qemu-demo/src/main.c using hil.h. Print Hello from firmware and return 0. Compile qemu-demo, then use run_qemu for 1 second. Explain the UART output. Do not flash.';
+const errorMessage = (error: unknown) => error instanceof TypeError
+  ? 'Cannot reach the backend. Check that it is running on port 8000.'
+  : error instanceof Error ? error.message : 'The request failed.';
 
-export default function App({ workflow = defaultWorkflow }: { workflow?: Workflow }) {
-  const [task, setTask] = useState('Send Hello over UART once per second.');
-  const [submittedTask, setSubmittedTask] = useState('');
+function ActivityLog({ entries }: { entries: LogEntry[] }) {
+  const window = useRef<HTMLDivElement>(null);
+  const follow = useRef(true);
+  useEffect(() => {
+    if (window.current && follow.current) window.current.scrollTop = window.current.scrollHeight;
+  }, [entries]);
+  return <div className="event-log" ref={window} onScroll={() => {
+    const el = window.current;
+    if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+  }} role="log" aria-label="Backend activity and QEMU UART output" aria-live="polite" aria-relevant="additions">
+    {!entries.length ? <p className="help log-empty">Waiting for backend activity…</p> : <ol>{entries.map((entry, index) =>
+      <li key={entry.id ?? `${entry.run_id}-${index}`} className={entry.source === 'QEMU UART' ? 'uart-entry' : entry.source === 'Error' ? 'error-entry' : ''}>
+        <div className="entry-meta"><time dateTime={entry.timestamp}>{new Date(entry.timestamp).toLocaleTimeString([], { hour12: false })}</time><span className="source">{entry.source}</span></div>
+        <p className="message">{entry.message}</p>
+        {entry.details && (entry.source === 'QEMU UART' || entry.source === 'QEMU'
+          ? <pre>{entry.details}</pre>
+          : <details><summary>Details</summary><pre>{entry.details}</pre></details>)}
+      </li>)}</ol>}
+  </div>;
+}
+
+export default function App() {
+  const [chats, setChats] = useState<ChatSummary[]>([]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [histories, setHistories] = useState<Record<string, Conversation>>({});
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState('');
-  const [status, setStatus] = useState<ExecutionStatus>('idle');
-  const [stage, setStage] = useState<Stage>('Idle');
-  const [attempt, setAttempt] = useState(0);
-  const [events, setEvents] = useState<WorkflowEvent[]>([]);
-  const [result, setResult] = useState<WorkflowResult | null>(null);
-  const currentId = useRef<string | null>(null);
-  const handle = useRef<ReturnType<Workflow['start']> | null>(null);
-  const running = status === 'running';
+  const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [activeRun, setActiveRun] = useState<ActiveRun | null>(null);
+  const localRun = useRef<{ id: string; chatId: string; controller: AbortController } | null>(null);
+  const transcript = useRef<HTMLDivElement>(null);
+  const follow = useRef(true);
+  const current = selected ? histories[selected] : undefined;
+  const task = selected ? drafts[selected] ?? '' : '';
 
-  useEffect(() => () => {
-    currentId.current = null;
-    handle.current?.stop();
-  }, [workflow]);
+  const loadChat = useCallback(async (id: string) => {
+    const incoming = await getChat(id);
+    setHistories(previous => ({ ...previous, [id]: mergeConversation(previous[id], incoming) }));
+  }, []);
 
-  function run() {
-    if (handle.current) return;
-    if (!task.trim()) { setError('Enter a firmware task before starting the demonstration.'); return; }
-    const runId = crypto.randomUUID();
-    currentId.current = runId;
-    setError(''); setSubmittedTask(task.trim()); setEvents([]); setResult(null);
-    setAttempt(0); setStage('Editing'); setStatus('running');
-    // Reserve synchronously so even rapid clicks cannot create concurrent runs.
-    handle.current = { stop() {} };
-    const control = workflow.start({ runId, task: task.trim() }, {
-      onProgress(nextStage, nextAttempt) {
-        if (currentId.current !== runId) return;
-        setStage(nextStage); setAttempt(nextAttempt);
-      },
-      onEvent(event) {
-        if (currentId.current === runId && event.runId === runId) setEvents(previous => [...previous, event]);
-      },
-      onResult(nextResult) {
-        if (currentId.current !== runId || nextResult.runId !== runId) return;
-        currentId.current = null;
-        handle.current = null;
-        setResult(nextResult);
-        setStatus(nextResult.outcome === 'stopped' ? 'stopped' : 'finished');
-        setStage(nextResult.outcome === 'stopped' ? 'Stopped' : 'Finished');
-      },
-    });
-    if (currentId.current === runId) handle.current = control;
+  const refreshList = useCallback(async () => {
+    const data = await listChats();
+    setChats(data.chats);
+    if (!localRun.current) setActiveRun(data.active_run);
+    return data.chats;
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    listChats().then(data => {
+      if (!mounted) return;
+      setChats(data.chats); setActiveRun(data.active_run);
+      const saved = localStorage.getItem('bench-chat');
+      setSelected(data.chats.some(chat => chat.id === saved) ? saved : data.chats[0]?.id ?? null);
+    }).catch(error => { if (mounted) setError(errorMessage(error)); })
+      .finally(() => { if (mounted) setLoading(false); });
+    return () => {
+      mounted = false;
+      const run = localRun.current;
+      localRun.current = null;
+      run?.controller.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!selected) return;
+    localStorage.setItem('bench-chat', selected);
+    follow.current = true;
+    loadChat(selected).catch(error => setError(errorMessage(error)));
+  }, [selected, loadChat]);
+
+  useEffect(() => {
+    if (!activeRun) return;
+    const interval = setInterval(() => {
+      refreshList().catch(() => {});
+      if (selected && !localRun.current) loadChat(selected).catch(() => {});
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [activeRun, selected, refreshList, loadChat]);
+
+  useEffect(() => {
+    const el = transcript.current;
+    if (el && follow.current) el.scrollTop = el.scrollHeight;
+  }, [current]);
+
+  async function newConversation() {
+    if (creating) return;
+    setCreating(true); setError('');
+    try {
+      const chat = await createChat();
+      setHistories(previous => ({ ...previous, [chat.id]: chat }));
+      setChats(previous => [chat, ...previous]);
+      setSelected(chat.id);
+    } catch (error) { setError(errorMessage(error)); }
+    finally { setCreating(false); }
   }
 
-  return (
-    <div className="shell">
-      <header className="topbar">
-        <a className="brand" href="./" aria-label="Bench home"><span className="brand-icon">▥</span> bench<span className="brand-sub"> / embedded AI</span></a>
-        <span className="project-label">THE BORING CLUB <span>·</span> HIL PROJECT</span>
-      </header>
-      <main>
-        <div className="intro">
-          <div><p className="eyebrow">FIRMWARE WORKSPACE / MVP 0.1</p><h1>A task. A test. A better iteration.</h1><p className="subtitle">Follow the path from firmware intent to measured feedback.</p></div>
-          <span className="local-label"><span className="dot" /> LOCAL DEMONSTRATION</span>
-        </div>
-        <div className="mock-banner"><span className="mock-symbol">◈</span><div><strong>Mock mode — no agent or hardware connected</strong><p>Run plays a fixed demonstration using sample firmware. Your task is not interpreted or executed. All logs, evidence, and outcomes are simulated.</p></div><span className="badge">SIMULATED</span></div>
-        <div className="workspace">
-          <section className="panel task-panel" aria-labelledby="task-heading">
-            <div className="section-heading"><span className="section-number">01</span><h2 id="task-heading">Define the task</h2></div>
-            <label htmlFor="task">Firmware task</label>
-            <textarea id="task" value={task} disabled={running} onChange={event => { setTask(event.target.value); setError(''); }} aria-describedby={error ? 'task-error task-help' : 'task-help'} aria-invalid={!!error} />
-            <p id="task-help" className="help">Describe the behavior you want to observe on the device.</p>
-            {error && <p id="task-error" role="alert" className="error">{error}</p>}
-            <div className="actions"><button className="primary" disabled={running} onClick={run}><span aria-hidden="true">▷</span> Run demo</button><button className="secondary" disabled={!running} onClick={() => handle.current?.stop()}><span aria-hidden="true">□</span> Stop</button></div>
-            <div className="device-card"><div className="device-title"><span className="chip" aria-hidden="true">▧</span><strong>Target device</strong><span className="disconnected"><span className="dot" /> Disconnected</span></div><p>Raspberry Pi Zero W</p><p className="help">No hardware connection is attempted in this MVP.</p></div>
-            <div className="scope-note"><p className="eyebrow">THE FEEDBACK LOOP</p><p>Task → agent → build → device → test → revision</p><p className="help">The Pi executes firmware. The separate FPGA observes connected digital signals and emitted debug milestones, not arbitrary program state.</p></div>
-          </section>
-          <section className="panel progress-panel" aria-labelledby="progress-heading">
-            <div className="section-heading"><span className="section-number">02</span><h2 id="progress-heading">Live progress</h2><span className={`status ${running ? 'active' : ''}`} role="status">{stage}</span></div>
-            <div className="stage-track" aria-label="Workflow stages">{stages.map((item, index) => <div className={stage === item ? 'selected' : ''} key={item}><span>{String(index + 1).padStart(2, '0')}</span>{item === 'Waiting for device' ? 'Waiting for device' : item}</div>)}</div>
-            <div className="log-heading"><span>EVENT STREAM <span className="muted">/ SIMULATED</span></span><span>{events.length} events{attempt > 0 ? ` · Attempt ${attempt}` : ''}</span></div>
-            <div className="event-log" role="log" aria-label="Simulated chronological event log" aria-live="polite" aria-relevant="additions">
-              {events.length === 0 ? <div className="empty-state"><span className="empty-icon" aria-hidden="true">⌁</span><h3>Ready when you are.</h3><p>Run the demo to watch a failed test,<br />a sample revision, and a passing test.</p><span className="terminal-hint">Waiting for a demonstration…</span></div> : <ol>{events.map((event, index) => <li key={`${event.runId}-${index}`}><time dateTime={event.timestamp}>{new Date(event.timestamp).toLocaleTimeString([], { hour12: false })}</time><span className={`source source-${event.source.toLowerCase()}`}>{event.source}</span><div><p><span className="sim-label">Simulated · </span>{event.message}</p>{event.details && <details><summary>View details</summary><pre>{event.details}</pre></details>}</div></li>)}</ol>}
-            </div>
-          </section>
-          <section className="panel result-panel" aria-labelledby="result-heading">
-            <div className="section-heading"><span className="section-number">03</span><h2 id="result-heading">Final result</h2><span className="muted small">SIMULATED OUTPUT</span></div>
-            {result ? <div className="result-content"><div className="result-overview"><span className={`outcome outcome-${result.outcome.replaceAll(' ', '-')}`}>Simulated · {result.outcome}</span><span className="attempt-count">{result.attempts} {result.attempts === 1 ? 'attempt' : 'attempts'}</span><p>{result.summary}</p><p className="help">Submitted task (not executed): {submittedTask}</p></div><div className="result-evidence"><details><summary>Simulated test evidence ({result.evidence.length})</summary>{result.evidence.length ? result.evidence.map(item => <div className="evidence" key={item.attempt}><strong>Simulated attempt {item.attempt} · {item.outcome}</strong><p>Expected: {item.expected}</p><p>Observed: {item.observed}</p></div>) : <p>No test evidence was produced before stopping.</p>}</details><details><summary>Simulated sample code diff</summary><p className="help">Illustrative sample only; unrelated to actual repository changes.</p><pre className="diff">{result.diff || 'No sample revision was reached before stopping.'}</pre></details></div></div> : <div className="result-placeholder"><span aria-hidden="true">↳</span><p>{running ? 'Demonstration in progress. The result will appear here.' : 'Your demonstration result will appear here.'}<small>Outcome, attempt count, test evidence, and a sample code diff.</small></p></div>}
-            <p className="result-footnote">A missing expected UART message is a test failure. An unavailable device means unable to test.</p>
-          </section>
-        </div>
-        <footer><span>BENCH / AI EMBEDDED HARDWARE-IN-THE-LOOP</span><span>Sample firmware. Simulated evidence. No hardware access.</span></footer>
-      </main>
-    </div>
-  );
+  async function removeConversation(id: string) {
+    if (!window.confirm('Delete this conversation and its logs? Shared workspace files will be kept.')) return;
+    try {
+      await deleteChat(id);
+      setHistories(previous => { const copy = { ...previous }; delete copy[id]; return copy; });
+      const remaining = await refreshList();
+      if (selected === id) setSelected(remaining[0]?.id ?? null);
+      setError('');
+    } catch (error) { setError(errorMessage(error)); }
+  }
+
+  async function send() {
+    if (!selected || localRun.current || activeRun) return;
+    if (!task.trim()) { setError('Enter a message first.'); return; }
+    const chatId = selected;
+    const id = crypto.randomUUID();
+    const controller = new AbortController();
+    localRun.current = { id, chatId, controller };
+    setActiveRun({ run_id: id, chat_id: chatId }); setStopping(false); setError('');
+    setDrafts(previous => ({ ...previous, [chatId]: '' }));
+    follow.current = true;
+    setHistories(previous => ({ ...previous, [chatId]: {
+      ...previous[chatId], runs: [...previous[chatId].runs, {
+        run_id: id, chat_id: chatId, task: task.trim(), created_at: new Date().toISOString(),
+        outcome: 'running', result: null, logs: [],
+      }],
+    } }));
+    try {
+      await streamTask(task.trim(), id, event => {
+        if (localRun.current?.id !== id || event.run_id !== id) return;
+        setHistories(previous => ({ ...previous, [chatId]: {
+          ...previous[chatId], runs: previous[chatId].runs.map(run => run.run_id !== id ? run : event.type === 'log'
+            ? { ...run, logs: [...run.logs.filter(log => !event.id || log.id !== event.id), event] }
+            : { ...run, result: event.result, outcome: 'completed' }),
+        } }));
+      }, controller.signal, chatId);
+    } catch (error) {
+      if (localRun.current?.id === id && !controller.signal.aborted) {
+        setError(errorMessage(error));
+        setDrafts(previous => ({ ...previous, [chatId]: task }));
+      }
+    } finally {
+      if (localRun.current?.id === id) {
+        localRun.current = null;
+        setActiveRun(null); setStopping(false);
+        // Reload the durable record, including errors, Stop, and cleanup messages.
+        try {
+          const saved = await getChat(chatId);
+          setHistories(previous => ({ ...previous, [chatId]: saved }));
+          await refreshList();
+        } catch (error) { setError(errorMessage(error)); }
+      }
+    }
+  }
+
+  async function stop() {
+    if (!activeRun || stopping) return;
+    setStopping(true);
+    try {
+      const stopped = await stopTask(activeRun.run_id);
+      if (!stopped && localRun.current?.id === activeRun.run_id) localRun.current.controller.abort();
+      if (!localRun.current) {
+        setActiveRun(null); setStopping(false);
+        if (selected) await loadChat(selected);
+        await refreshList();
+      }
+    } catch (error) { setError(errorMessage(error)); setStopping(false); }
+  }
+
+  return <div className="chat-app">
+    <aside className="sidebar" aria-label="Conversations">
+      <a className="brand" href="./"><span className="brand-icon" aria-hidden="true">▥</span> bench <span>/ embedded AI</span></a>
+      <button className="new-chat" onClick={newConversation} disabled={creating}>＋ New conversation</button>
+      <p className="eyebrow sidebar-label">CONVERSATIONS</p>
+      <nav>{chats.map(chat => <div key={chat.id} className={`chat-row ${selected === chat.id ? 'selected' : ''}`}>
+        <button className="chat-select" aria-current={selected === chat.id ? 'page' : undefined} onClick={() => { setSelected(chat.id); setError(''); }}>{chat.title}</button>
+        <button className="delete-chat" aria-label={`Delete ${chat.title}`} title="Delete conversation; keep files" disabled={activeRun?.chat_id === chat.id} onClick={() => removeConversation(chat.id)}>×</button>
+      </div>)}</nav>
+      <div className="sidebar-note"><strong>One shared workspace</strong><p>All chats can read and edit the same files. Deleting a chat keeps those files.</p><span>THE BORING CLUB · HIL PROJECT</span></div>
+    </aside>
+    <main className="chat-main">
+      <header className="chat-header"><div><p className="eyebrow">FIRMWARE WORKSPACE</p><h1>{current?.title ?? 'Write. Run. Observe.'}</h1></div><span>Local agent · physical flashing simulated</span></header>
+      <div className="transcript" ref={transcript} onScroll={() => {
+        const el = transcript.current;
+        if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      }}>
+        {(!current || !current.runs.length) && <div className="welcome"><span aria-hidden="true">⌁</span><h2>{loading ? 'Loading conversations…' : selected ? 'What shall we build?' : 'Start a conversation.'}</h2><p>Ask the agent to inspect files, write firmware, compile it, or observe its UART output in QEMU.</p><p>Messages and activity logs are saved locally. Every chat shares the current workspace files.</p>{!selected && <button className="primary" onClick={newConversation} disabled={creating || loading}>＋ New conversation</button>}</div>}
+        {current?.runs.map(run => <article className="turn" key={run.run_id}>
+          <div className="user-message"><div className="message-label">YOU <time dateTime={run.created_at}>{new Date(run.created_at).toLocaleString()}</time></div><p>{run.task}</p></div>
+          <details className="run-log" open={activeRun?.run_id === run.run_id ? true : undefined}>
+            <summary>Activity log <span>{run.logs.length} entries · includes QEMU output</span></summary>
+            <ActivityLog entries={run.logs} />
+          </details>
+          {run.result ? <div className="assistant-message"><div className="message-label">BENCH AGENT <span>{run.result.model}</span></div><div className="answer"><Markdown skipHtml>{run.result.final_response}</Markdown></div></div>
+            : activeRun?.run_id !== run.run_id && <p className="help no-answer">No final reply for this turn. See the activity log for details.</p>}
+        </article>)}
+      </div>
+      <div className="composer-area">
+        {error && <p className="error" role="alert">{error}</p>}
+        <form className="composer" onSubmit={event => { event.preventDefault(); void send(); }}>
+          <label className="sr-only" htmlFor="message">Message the firmware agent</label>
+          <textarea id="message" value={task} disabled={!current || !!activeRun} placeholder={selected ? 'Ask a question or request a firmware change…' : 'Create a conversation to begin…'} onChange={event => { if (selected) setDrafts(previous => ({ ...previous, [selected]: event.target.value })); }} onKeyDown={event => {
+            if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); void send(); }
+          }} />
+          <div className="composer-actions"><button type="button" className="example-button" disabled={!current || !!activeRun} onClick={() => { if (selected) setDrafts(previous => ({ ...previous, [selected]: example })); }}>Use QEMU example</button><div><button type="button" className="secondary" disabled={!activeRun || stopping} onClick={stop}>{stopping ? 'Stopping…' : 'Stop'}</button><button className="primary" type="submit" disabled={!current || !!activeRun || !task.trim()}>Send ↑</button></div></div>
+        </form>
+        <p className="composer-note">Real model calls, files, builds, and QEMU. One run at a time. Saved chat history does not restore earlier file versions.</p>
+      </div>
+    </main>
+  </div>;
 }

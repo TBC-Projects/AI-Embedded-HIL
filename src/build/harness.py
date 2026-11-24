@@ -117,11 +117,7 @@ import re
 import shutil
 from pathlib import Path
 
-# Support both package imports from orchestration and the existing local CLI/tests.
-if __package__:
-    from .common import StageResult
-else:
-    from common import StageResult
+from common import StageResult
 
 # The folder holding the 4 files that get copied into every attempt.
 TARGET_DIR = Path(__file__).resolve().parent / "target"

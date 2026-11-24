@@ -42,14 +42,15 @@ This report serves two primary functions:
 
 ## Local MVP
 
-The current implementation is a browser-local demonstration plus an independent
-FastAPI endpoint using Google ADK and Gemini with local file tools, real ARM
-compilation through `src/build/build.py`, and simulated flashing. The agent can
+The current implementation is a React dashboard connected to a FastAPI backend
+using Google ADK and Gemini with local file tools, real ARM
+compilation through `src/orchestration/compiler.py`, bounded QEMU UART observations,
+and simulated flashing. The agent can
 save and revise real source files in the shared
-`src/orchestration/workspaces/` directory across requests. Each conversation starts
-fresh. Builds require the ARM toolchain described in the orchestration README.
-The backend does not upload binaries or access hardware. No authentication,
-database, or deployment is included.
+`src/orchestration/workspaces/` directory across all chats. Conversation context and activity logs persist in SQLite;
+follow-up messages reuse the selected chat. Builds require the ARM toolchain described in the orchestration README.
+The backend does not upload binaries or access hardware. SQLite is built into
+Python; pip installs its async adapter. No authentication or deployment is included.
 
 Frontend (Node.js 22.14+):
 
@@ -59,32 +60,47 @@ npm ci
 npm run dev
 ```
 
-Open the local URL printed by Vite. Run plays a fixed simulated UART example:
-failed test → scripted revision → passing test. The task is not interpreted or
-executed. All evidence and the illustrative diff are simulated, and the real device
-indicator stays Disconnected. Stop cancels playback.
+Open the local URL printed by Vite after starting the backend below. Send submits
+your message to the real agent in the selected chat. The sidebar selects saved
+conversations; each turn keeps its chronological backend/QEMU log and Markdown answer. Stop
+cancels backend work and waits for cleanup. Only one run can be active at a time.
 
-Backend (Python 3.10+, from the repository root):
+Backend (Python 3.10+, from the repository root).
+
+macOS / Linux:
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r src/orchestration/requirements.txt
+./.venv/bin/python -m pip install -r src/orchestration/requirements.txt
 export GOOGLE_API_KEY='your-Google-AI-Studio-API-key'
-python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
+./.venv/bin/python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+Windows (PowerShell):
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r src\orchestration\requirements.txt
+$env:GOOGLE_API_KEY = "your-Google-AI-Studio-API-key"
+.\.venv\Scripts\python.exe -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+On Windows, `Activate.ps1` may be blocked by the execution policy, so the block
+above calls `.\.venv\Scripts\python.exe` directly; `curl` is an alias for
+`Invoke-WebRequest`, so use `curl.exe` or `Invoke-RestMethod`.
+
 `GET /health` returns 200. `POST /tasks` sends the prompt to a Gemini agent with
-local file tools, a real compile tool, and simulated flashing. It returns the workspace path,
+local file tools, real compile and bounded QEMU tools, and simulated flashing. It returns the workspace path,
 answer, and tool transcript. See the [file generation example](src/orchestration/README.md#generate-a-real-local-file) and
 [test prompts and long-wait notes](src/orchestration/README.md#long-waits-and-test-prompts)
 before testing: some runs have waited a long time for a final model response, and
-there is no overall backend timeout. The frontend remains independent and does
-not need this server running.
+there is no overall backend timeout. The frontend needs this server running and
+uses /tasks/stream through Vite's /api proxy. Closing the stream cancels its run.
 
 | Directory | Responsibility and integration point |
 | --- | --- |
-| `src/dashboard/` | UI; typed workflow interface and replaceable mock workflow. Connect a future backend transport here. |
+| `src/dashboard/` | Saved conversation sidebar, messages, streamed backend/QEMU logs, Stop, and answers. |
 | `src/orchestration/` | API and future isolated agent loop, permitted tool calls, revisions, and retry limits. |
 | `src/runner/` | Future build/artifact handling, upload/start, UART/FPGA feedback, timeout/reset/recovery. No service yet. |
 | `src/target/` | Raspberry Pi firmware (unchanged). |

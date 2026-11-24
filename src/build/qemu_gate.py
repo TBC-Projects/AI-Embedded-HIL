@@ -95,11 +95,7 @@ import selectors
 import subprocess
 import time
 from pathlib import Path
-# Support both package imports from orchestration and the existing local CLI/tests.
-if __package__:
-    from .common import StageResult, tail
-else:
-    from common import StageResult, tail
+from common import StageResult, tail
 
 # the emulator program; "-M raspi0" (below) makes it pretend to be a Raspberry Pi Zero
 QEMU = "qemu-system-arm"

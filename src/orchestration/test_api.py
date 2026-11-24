@@ -5,10 +5,12 @@ import unittest
 import io
 import shutil
 import zlib
+import json
+from uuid import uuid4
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 from google.adk.models.llm_response import LlmResponse
@@ -17,11 +19,10 @@ from google.adk.models.registry import LLMRegistry
 from google.genai import types
 from google.genai.errors import ClientError
 
-from src.orchestration import main as orchestration_main
 from src.orchestration.main import MODEL, TaskRequest, app, run_agent_loop
-from src.build import build as firmware_build
-from src.build import qemu_gate as firmware_qemu
-from src.build.common import StageResult
+from src.orchestration import compiler as firmware_build
+from src.orchestration.compiler import StageResult
+from src.orchestration import qemu as firmware_qemu
 
 MODEL_METHOD = "google.adk.models.google_llm.Gemini.generate_content_async"
 
@@ -36,22 +37,21 @@ def fake_model(*, try_invalid_artifacts=False):
             if part.function_response
         ]
         if try_invalid_artifacts:
-            sequence = ["flash_before_build", "compile", "test", "flash_wrong_id", "flash", "final"]
+            sequence = ["flash_before_build", "compile", "flash_wrong_id", "flash", "final"]
         else:
-            sequence = ["compile", "test", "flash", "final"]
+            sequence = ["compile", "flash", "final"]
         step = sequence[len(results)]
         if step == "compile":
             name, args = "compile_firmware", {}
         elif step in ("flash_before_build", "flash_wrong_id"):
             name, args = "flash_firmware", {"artifact_id": "not-a-built-artifact"}
-        elif step in ("test", "flash"):
+        elif step == "flash":
             build = next(result.response for result in results if result.name == "compile_firmware")
-            name = "test_firmware" if step == "test" else "flash_firmware"
-            args = {"artifact_id": build["artifact_id"]}
+            name, args = "flash_firmware", {"artifact_id": build["artifact_id"]}
         else:
             yield LlmResponse(content=types.Content(role="model", parts=[
                 types.Part(text="Private reasoning must not appear in the API.", thought=True),
-                types.Part(text="Compilation and the QEMU test succeeded; flashing was simulated. No hardware was contacted."),
+                types.Part(text="Compilation succeeded and flashing was simulated. No hardware was contacted."),
             ]))
             return
         yield LlmResponse(content=types.Content(role="model", parts=[
@@ -64,7 +64,7 @@ def fake_file_model(operations):
     """Request real ADK file operations without contacting Gemini."""
     async def generate(model, llm_request, stream=False):
         assert set(llm_request.tools_dict) == {
-            "ReadFile", "WriteFile", "EditFile", "compile_firmware", "test_firmware", "flash_firmware",
+            "ReadFile", "WriteFile", "EditFile", "list_directory", "compile_firmware", "run_qemu", "flash_firmware",
         }  # In particular, shell execution must not be offered to the model.
         results = [
             part.function_response
@@ -78,13 +78,10 @@ def fake_file_model(operations):
             ]))
             return
         name, args = operations[len(results)]
-        if name in ("test_firmware", "flash_firmware"):
-            # test uses the latest successful build; flash uses the latest passing test.
-            source = "compile_firmware" if name == "test_firmware" else "test_firmware"
-            args = {"artifact_id": next(
-                (result.response["artifact_id"] for result in reversed(results)
-                 if result.name == source and result.response["status"] == "success"),
-                "no-successful-artifact",
+        if name in {"flash_firmware", "run_qemu"} and "artifact_id" not in args:
+            args = {**args, "artifact_id": next(
+                result.response["artifact_id"] for result in reversed(results)
+                if result.name == "compile_firmware" and result.response["status"] == "success"
             )}
         yield LlmResponse(content=types.Content(role="model", parts=[
             types.Part(function_call=types.FunctionCall(name=name, args=args)),
@@ -104,32 +101,24 @@ class ApiTests(unittest.TestCase):
         root_patch = patch("src.orchestration.main.WORKSPACE_ROOT", self.workspace_root)
         root_patch.start()
         self.addCleanup(root_patch.stop)
+        data_patch = patch("src.orchestration.main.DATA_DIR", self.workspace_root.parent / "data")
+        data_patch.start()
+        self.addCleanup(data_patch.stop)
         self.real_build = firmware_build.run
 
         def test_build(project):
             # Most tests focus on ADK plumbing; real compiler tests follow below.
             binary = project / "kernel.bin"
             binary.write_bytes(b"test binary")
-            (project / "kernel.elf").write_bytes(b"test elf")
+            elf = project / "kernel.elf"
+            elf.write_bytes(b"test ELF")
             return StageResult("build", True, "test build succeeded", artifacts={
-                "bin": str(binary), "length": binary.stat().st_size,
+                "elf": str(elf), "bin": str(binary), "length": binary.stat().st_size,
             })
 
         build_patch = patch("src.orchestration.main.firmware_build.run", side_effect=test_build)
         self.build_mock = build_patch.start()
         self.addCleanup(build_patch.stop)
-        # The harness rules and the QEMU gate pass by default, like the build above.
-        # Tests that check them restore the real functions or return failures.
-        self.real_rules = orchestration_main.check_code_rules
-        rules_patch = patch("src.orchestration.main.check_code_rules",
-                            return_value=StageResult("harness", True, "test rules passed"))
-        self.rules_mock = rules_patch.start()
-        self.addCleanup(rules_patch.stop)
-        qemu_patch = patch("src.orchestration.main.firmware_qemu.run",
-                           return_value=StageResult("qemu", True, "test QEMU passed",
-                                                    artifacts={"console": "HIL:BOOT\nHIL:DONE\n"}))
-        self.qemu_mock = qemu_patch.start()
-        self.addCleanup(qemu_patch.stop)
         self.client = TestClient(app)
         # A dummy value passes our configuration check. Network calls are mocked.
         self.environment = patch.dict("os.environ", {"GOOGLE_API_KEY": "offline-test-key"})
@@ -164,14 +153,11 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(data["simulated"])
         events = data["tool_events"]
         self.assertEqual([event["name"] for event in events], [
-            "compile_firmware", "compile_firmware", "test_firmware", "test_firmware",
-            "flash_firmware", "flash_firmware",
+            "compile_firmware", "compile_firmware", "flash_firmware", "flash_firmware",
         ])
         artifact = events[1]["result"]["artifact_id"]
         self.assertEqual(events[2]["arguments"]["artifact_id"], artifact)
         self.assertEqual(events[3]["result"]["status"], "success")
-        self.assertEqual(events[4]["arguments"]["artifact_id"], artifact)
-        self.assertEqual(events[5]["result"]["status"], "success")
         self.assertNotIn("Private reasoning", data["final_response"])
 
     def test_flash_rejects_unbuilt_and_wrong_artifacts(self):
@@ -179,8 +165,8 @@ class ApiTests(unittest.TestCase):
             response = self.submit()
         self.assertEqual(response.status_code, 200, response.text)
         results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
-        self.assertEqual([result["status"] for result in results], ["error", "success", "success", "error", "success"])
-        self.assertEqual([result["simulated"] for result in results], [True, False, False, True, True])
+        self.assertEqual([result["status"] for result in results], ["error", "success", "error", "success"])
+        self.assertEqual([result["simulated"] for result in results], [True, False, True, True])
 
     def test_new_task_gets_fresh_session_and_build(self):
         with patch(MODEL_METHOD, fake_model()):
@@ -224,7 +210,6 @@ class ApiTests(unittest.TestCase):
             ("EditFile", {"path": "firmware/main.c", "old_string": "return 0", "new_string": "return 1"}),
             ("ReadFile", {"path": "firmware/main.c"}),
             ("compile_firmware", {}),
-            ("test_firmware", {}),
             ("flash_firmware", {}),
         ]
         with patch(MODEL_METHOD, fake_file_model(operations)):
@@ -235,7 +220,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(workspace, self.workspace_root)
         self.assertEqual((workspace / "firmware/main.c").read_text(), "int main(void) { return 1; }\n")
         results = [event["result"] for event in data["tool_events"] if event["type"] == "tool_result"]
-        self.assertEqual([result["status"] for result in results], ["ok", "ok", "ok", "ok", "success", "success", "success"])
+        self.assertEqual([result["status"] for result in results], ["ok", "ok", "ok", "ok", "success", "success"])
         self.assertIn("return 0", results[1]["content"])
         self.assertIn("return 1", results[3]["content"])
 
@@ -271,14 +256,54 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(all(result["status"] == "error" for result in results))
         self.assertFalse(outside.exists())
 
+    def test_directory_listing_discovers_existing_source_for_model(self):
+        project = self.workspace_root / "uart-hello" / "src"
+        project.mkdir(parents=True)
+        (project / "main.c").write_text("int main(void) { return 0; }\n")
+        with patch(MODEL_METHOD, fake_file_model([
+            ("list_directory", {}),
+            ("list_directory", {"path": "uart-hello/src"}),
+            ("ReadFile", {"path": "uart-hello/src/main.c"}),
+        ])):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
+        self.assertEqual(results[0]["entries"], [{"name": "uart-hello", "path": "uart-hello", "type": "directory"}])
+        self.assertEqual(results[1]["entries"], [{"name": "main.c", "path": "uart-hello/src/main.c", "type": "file"}])
+        self.assertIn("return 0", results[2]["content"])
+
+    def test_directory_listing_rejects_escape_links_missing_and_file_paths(self):
+        self.workspace_root.mkdir()
+        (self.workspace_root / "file.c").write_text("test")
+        (self.workspace_root / "outside-link").symlink_to(self.workspace_root.parent, target_is_directory=True)
+        operations = [("list_directory", {"path": path}) for path in (
+            "..", str(self.workspace_root.parent), "outside-link", "missing", "file.c",
+        )]
+        with patch(MODEL_METHOD, fake_file_model(operations)):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
+        self.assertTrue(all(result["status"] == "error" for result in results))
+
+    def test_directory_listing_handles_empty_and_truncated_directories(self):
+        self.workspace_root.mkdir()
+        with patch(MODEL_METHOD, fake_file_model([("list_directory", {})])):
+            empty = self.submit().json()["tool_events"][1]["result"]
+        self.assertEqual(empty["entries"], [])
+        self.assertFalse(empty["truncated"])
+        for index in range(201):
+            (self.workspace_root / f"file-{index:03}.c").touch()
+        with patch(MODEL_METHOD, fake_file_model([("list_directory", {})])):
+            listing = self.submit().json()["tool_events"][1]["result"]
+        self.assertEqual(len(listing["entries"]), 200)
+        self.assertTrue(listing["truncated"])
+
     @unittest.skipUnless(shutil.which(firmware_build.CC) and shutil.which(firmware_build.OBJCOPY), "ARM toolchain not installed")
     def test_agent_writes_and_really_compiles_firmware(self):
         self.build_mock.side_effect = self.real_build
-        self.rules_mock.side_effect = self.real_rules
         operations = [
             ("WriteFile", {"path": "demo/src/main.c", "content": 'int main(void) { return 0; }\n'}),
             ("compile_firmware", {"project_dir": "demo"}),
-            ("test_firmware", {}),
             ("flash_firmware", {}),
         ]
         with patch(MODEL_METHOD, fake_file_model(operations)):
@@ -294,14 +319,12 @@ class ApiTests(unittest.TestCase):
         binary = (project / "kernel.bin").read_bytes()
         self.assertEqual(build["artifacts"]["length"], len(binary))
         self.assertEqual(build["artifacts"]["crc32"], zlib.crc32(binary))
-        self.assertEqual(results[2]["status"], "success", results[2])     # QEMU (mocked here)
-        self.assertEqual(results[3]["artifact_id"], build["artifact_id"])
-        self.assertTrue(results[3]["simulated"])
+        self.assertEqual(results[2]["artifact_id"], build["artifact_id"])
+        self.assertTrue(results[2]["simulated"])
 
     @unittest.skipUnless(shutil.which(firmware_build.CC) and shutil.which(firmware_build.OBJCOPY), "ARM toolchain not installed")
     def test_agent_receives_compiler_error_and_can_fix_it(self):
         self.build_mock.side_effect = self.real_build
-        self.rules_mock.side_effect = self.real_rules
         operations = [
             ("WriteFile", {"path": "demo/src/main.c", "content": "int main(void) { return 0 }\n"}),
             ("compile_firmware", {"project_dir": "demo"}),
@@ -353,122 +376,74 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(result["blame"], "rig")
 
     def test_failed_rebuild_invalidates_previous_artifact(self):
-        outcomes = [
-            StageResult("build", True, "built", artifacts={"bin": "kernel.bin"}),
+        self.build_mock.side_effect = [
+            StageResult("build", True, "built", artifacts={"elf": "kernel.elf", "bin": "kernel.bin"}),
             StageResult("build", False, "compile failed", feedback="syntax error"),
         ]
-
-        def build_then_fail(project):
-            (project / "kernel.elf").write_bytes(b"test elf")   # test_firmware copies this
-            return outcomes.pop(0)
-
-        self.build_mock.side_effect = build_then_fail
-        operations = [("compile_firmware", {}), ("test_firmware", {}), ("compile_firmware", {}), ("flash_firmware", {})]
+        operations = [("compile_firmware", {}), ("compile_firmware", {}), ("flash_firmware", {})]
         with patch(MODEL_METHOD, fake_file_model(operations)):
             response = self.submit()
         self.assertEqual(response.status_code, 200, response.text)
         results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
-        self.assertEqual([result["status"] for result in results], ["success", "success", "error", "error"])
-
-    def test_harness_rejects_bad_code_before_compiling(self):
-        self.rules_mock.side_effect = self.real_rules
-        operations = [
-            ("WriteFile", {"path": "demo/src/main.c",
-                           "content": '#include <stdio.h>\nint main(void) { printf("hi"); return 0; }\n'}),
-            ("compile_firmware", {"project_dir": "demo"}),
-        ]
-        with patch(MODEL_METHOD, fake_file_model(operations)):
-            response = self.submit()
-        self.assertEqual(response.status_code, 200, response.text)
-        result = response.json()["tool_events"][3]["result"]
-        self.assertEqual(result["status"], "error")
-        self.assertEqual(result["failed_stage"], "harness")
-        self.assertEqual(result["blame"], "code")
-        self.assertIn("stdio", result["feedback"])
-        self.assertIsNone(result["artifact_id"])
-        self.build_mock.assert_not_called()      # gcc never ran
-        self.qemu_mock.assert_not_called()
-        # The harness works in a temporary folder and never deletes the agent's files.
-        self.assertTrue((self.workspace_root / "demo/src/main.c").is_file())
-
-    def test_test_firmware_runs_qemu_in_project_subfolder(self):
-        operations = [
-            ("WriteFile", {"path": "demo/src/main.c", "content": "int main(void) { return 0; }\n"}),
-            ("compile_firmware", {"project_dir": "demo"}),
-            ("test_firmware", {}),
-        ]
-        with patch(MODEL_METHOD, fake_file_model(operations)):
-            response = self.submit()
-        self.assertEqual(response.status_code, 200, response.text)
-        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
-        build, test = results[1], results[2]
-        self.assertEqual(build["status"], "success", build)
-        self.qemu_mock.assert_called_once()        # compile_firmware no longer runs QEMU itself
-        test_dir = self.workspace_root.resolve() / "demo" / "test_firmware"
-        self.qemu_mock.assert_called_once_with(test_dir / "kernel.elf")
-        self.assertEqual(test["status"], "success", test)
-        self.assertEqual(test["artifact_id"], build["artifact_id"])
-        self.assertEqual(test["test_dir"], str(test_dir))
-        self.assertIn("HIL:DONE", test["console"])                      # QEMU output reaches the model
-        self.assertIn("HIL:DONE", (test_dir / "qemu.log").read_text())  # and is saved in the subfolder
-
-    def test_compile_alone_does_not_run_qemu(self):
-        with patch(MODEL_METHOD, fake_file_model([("compile_firmware", {})])):
-            response = self.submit()
-        self.assertEqual(response.json()["tool_events"][1]["result"]["status"], "success")
-        self.qemu_mock.assert_not_called()
-
-    def test_test_firmware_rejects_unbuilt_and_wrong_artifacts(self):
-        with patch(MODEL_METHOD, fake_file_model([("test_firmware", {})])):
-            response = self.submit()
-        result = response.json()["tool_events"][1]["result"]
-        self.assertEqual(result["status"], "error")
-        self.assertFalse(result["simulated"])
-        self.qemu_mock.assert_not_called()
-
-    def test_flash_requires_a_passing_test(self):
-        operations = [("compile_firmware", {}), ("flash_firmware", {})]   # skipped test_firmware
-        with patch(MODEL_METHOD, fake_file_model(operations)):
-            response = self.submit()
-        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
-        self.assertEqual([result["status"] for result in results], ["success", "error"])
-
-    def test_qemu_failure_is_code_blame_and_blocks_flashing(self):
-        self.qemu_mock.side_effect = [
-            StageResult("qemu", True, "booted and finished"),
-            StageResult("qemu", False, "no HIL:DONE after 5s (hang or infinite loop)",
-                        feedback="QEMU test failed: hang.\nConsole output:\nHIL:BOOT\nstuck"),
-        ]
-        operations = [("compile_firmware", {}), ("test_firmware", {}),
-                      ("compile_firmware", {}), ("test_firmware", {}), ("flash_firmware", {})]
-        with patch(MODEL_METHOD, fake_file_model(operations)):
-            response = self.submit()
-        self.assertEqual(response.status_code, 200, response.text)
-        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
-        self.assertEqual([result["status"] for result in results], ["success", "success", "success", "error", "error"])
-        failed_test = results[3]
-        self.assertEqual(failed_test["blame"], "code")
-        self.assertIn("stuck", failed_test["feedback"])
+        self.assertEqual([result["status"] for result in results], ["success", "error", "error"])
 
     @unittest.skipUnless(
-        shutil.which(firmware_build.CC) and shutil.which(firmware_build.OBJCOPY) and shutil.which(firmware_qemu.QEMU),
-        "ARM toolchain and qemu-system-arm needed")
-    def test_real_harness_build_and_qemu_end_to_end(self):
-        self.rules_mock.side_effect = self.real_rules
+        shutil.which(firmware_build.CC) and shutil.which(firmware_build.OBJCOPY)
+        and shutil.which(firmware_qemu.QEMU), "ARM toolchain and QEMU not installed",
+    )
+    def test_qemu_output_reaches_model_after_real_build(self):
         self.build_mock.side_effect = self.real_build
-        self.qemu_mock.side_effect = firmware_qemu.run
-        operations = [
-            ("WriteFile", {"path": "demo/src/main.c",
-                           "content": '#include "hil.h"\nint main(void) { hil_puts("hello\\n"); return 0; }\n'}),
-            ("compile_firmware", {"project_dir": "demo"}),
-            ("test_firmware", {}),
-        ]
-        with patch(MODEL_METHOD, fake_file_model(operations)):
+        transport = fake_file_model([
+            ("WriteFile", {"path": "hello/src/main.c", "content": '#include "hil.h"\nint main(void) { hil_puts("Hello from firmware\\n"); return 0; }\n'}),
+            ("compile_firmware", {"project_dir": "hello"}),
+            ("run_qemu", {}),
+        ])
+
+        async def inspect_model(model, llm_request, stream=False):
+            for content in llm_request.contents:
+                for part in content.parts or []:
+                    response = part.function_response
+                    if response and response.name == "run_qemu":
+                        self.assertIn("Hello from firmware", response.response["uart_output"])
+                        self.assertEqual(response.response["execution_status"], "observation_complete")
+            async for result in transport(model, llm_request, stream):
+                yield result
+
+        with patch(MODEL_METHOD, inspect_model):
             response = self.submit()
-        results = [event["result"] for event in response.json()["tool_events"] if event["type"] == "tool_result"]
-        self.assertEqual(results[1]["status"], "success", results[1])
-        self.assertEqual(results[2]["status"], "success", results[2])
-        self.assertIn("hello", results[2]["console"])
+        self.assertEqual(response.status_code, 200, response.text)
+        observation = response.json()["tool_events"][-1]["result"]
+        self.assertEqual(observation["stopped_by"], "observation_limit")
+        self.assertEqual(observation["uart_output"].count("HIL:BOOT"), 1)
+        self.assertEqual(observation["uart_output"].count("HIL:DONE"), 1)
+        self.assertEqual(observation["qemu_errors"], "")
+
+    def test_qemu_rejects_unknown_artifact_without_starting_process(self):
+        with patch("src.orchestration.main.firmware_qemu.observe") as observe, patch(
+            MODEL_METHOD, fake_file_model([("run_qemu", {"artifact_id": "unknown"})]),
+        ):
+            response = self.submit()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["tool_events"][1]["result"]["execution_status"], "invalid_request")
+        observe.assert_not_called()
+
+    def test_stream_delivers_logs_qemu_capture_and_final_answer(self):
+        run_id = str(uuid4())
+        with patch(MODEL_METHOD, fake_file_model([
+            ("compile_firmware", {}), ("run_qemu", {}),
+        ])), patch("src.orchestration.main.firmware_qemu.observe", new=AsyncMock(return_value={
+            "execution_status": "observation_complete", "uart_output": "HIL:BOOT\nHello\nHIL:DONE\n",
+            "qemu_errors": "", "stopped_by": "observation_limit",
+        })):
+            response = self.client.post(f"/tasks/stream?run_id={run_id}", json={"task": "Compile and observe"})
+        self.assertEqual(response.status_code, 200, response.text)
+        events = [json.loads(line) for line in response.text.splitlines()]
+        self.assertTrue(all(event["run_id"] == run_id for event in events))
+        self.assertTrue(all(event["type"] in {"log", "final"} for event in events))
+        uart = next(event for event in events if event.get("source") == "QEMU UART")
+        self.assertIn("Hello", uart["details"])
+        self.assertEqual(events[-1]["type"], "final")
+        self.assertNotIn("Private reasoning", response.text)
 
 
 class ProgressTests(unittest.IsolatedAsyncioTestCase):
@@ -478,6 +453,9 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         root_patch = patch("src.orchestration.main.WORKSPACE_ROOT", Path(temporary.name))
         root_patch.start()
         self.addCleanup(root_patch.stop)
+        data_patch = patch("src.orchestration.main.DATA_DIR", Path(temporary.name) / "data")
+        data_patch.start()
+        self.addCleanup(data_patch.stop)
 
     async def test_waiting_logs_model_turns_and_cleans_up(self):
         transport = fake_model()
@@ -494,7 +472,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
             result = await run_agent_loop(TaskRequest(task="Compile and flash"))
 
         text = output.getvalue()
-        self.assertIn("Creating fresh in-memory session", text)
+        self.assertIn("Creating saved conversation session", text)
         self.assertIn("Still active; current stage: waiting for Gemini response #1", text)
         self.assertIn("Received Gemini response for model call #3", text)
         self.assertIn("Agent run completed", text)

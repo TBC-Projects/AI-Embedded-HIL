@@ -1,15 +1,17 @@
 # Orchestration: minimal Gemini agent
 
-One Google ADK Agent and InMemoryRunner handle each task. Gemini makes real API
+One Google ADK Agent and Runner handle each turn, using a saved SQLite session for each chat. Gemini makes real API
 calls and can use ADK's built-in ReadFile, WriteFile, and EditFile tools to create
-real local source files. compile_firmware runs the harness code rules and build.py
-(real ARM binaries); test_firmware boots that build in the QEMU gate (an emulated
-Pi Zero). The order is compile -> test -> flash. Only flash_firmware remains simulated;
-no Raspberry Pi is contacted. The dashboard still uses its separate browser-local mock workflow.
+real local source files. compile_firmware calls the local compiler.py helper to produce
+real ARM binaries. Only flash_firmware remains simulated; no Raspberry Pi is
+contacted. run_qemu can execute a build for a bounded observation window and return
+its UART output to Gemini. The dashboard streams real backend activity and inline QEMU captures.
 
 ## Run locally
 
-From the repository root, create a virtual environment (Python 3.11+ recommended):
+From the repository root, create a virtual environment (Python 3.11+ recommended).
+
+macOS / Linux:
 
 ```sh
 python3 -m venv .venv
@@ -19,9 +21,22 @@ export GOOGLE_API_KEY='your-Google-AI-Studio-API-key'
 ./.venv/bin/python -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+Windows (PowerShell):
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r src\orchestration\requirements.txt
+$env:GOOGLE_API_KEY = "your-Google-AI-Studio-API-key"
+.\.venv\Scripts\python.exe -m uvicorn src.orchestration.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+On Windows, `Activate.ps1` may be blocked by the execution policy, so call
+`.\.venv\Scripts\python.exe` directly; use `curl.exe` or `Invoke-RestMethod`
+where the examples below say `curl`.
+
 Get a key from https://aistudio.google.com/apikey. Keep it outside Git. The backend
 reads GOOGLE_API_KEY; this demo explicitly uses the Gemini API rather than Vertex
-AI. Model: `gemini-3.8-flash` (the `MODEL` constant in main.py, without a `models/`
+AI. Model: `gemini-3.5-flash-lite` (the `MODEL` constant in main.py, without a `models/`
 prefix because ADK resolves bare Gemini IDs). Actual model calls
 require model access, available quota, and network connectivity.
 
@@ -31,22 +46,21 @@ In another terminal:
 curl http://127.0.0.1:8000/health
 curl -sS --max-time 90 http://127.0.0.1:8000/tasks \
   -H 'Content-Type: application/json' \
-  -d '{"task":"Write build-demo/src/main.c with int main(void) that returns 0. Call compile_firmware with project_dir build-demo. If the build succeeds, call test_firmware with the returned artifact_id. If that passes, call flash_firmware once with the same artifact_id. Report the real build and QEMU results and the simulated flash result, then finish."}' \
+  -d '{"task":"Write build-demo/src/main.c with int main(void) that returns 0. Call compile_firmware with project_dir build-demo. If the build succeeds, call flash_firmware once with the returned artifact_id. Report the real build result and simulated flash result, then finish."}' \
   | python3 -m json.tool
 ```
 
-The response contains `session_id`, `model`, `workspace`, `simulated`, `simulation_note`,
+The response contains `chat_id`, `run_id`, `session_id`, `model`, `workspace`, `simulated`, `simulation_note`,
 `tool_events` (calls, arguments, and results), and `final_response`. Tool events and
 Gemini's final answer are also printed in the server terminal. `simulated: true`
-refers to flashing only; Gemini, file operations, code checks, compilation, and the
-QEMU run are real. The server logs
+refers to flashing only; Gemini, file operations, and compilation are real. The server logs
 session setup, model requests/responses, tool execution, completion/failure, and
 cleanup with a run ID and elapsed seconds. Every 10 seconds a local heartbeat
 reports the current stage; it does not imply Google is making progress. Prompts
 and model thought content are not logged. There is no overall time limit yet.
 API docs are at
-http://127.0.0.1:8000/docs. Requests wait until completion; there is no streaming or
-background job queue.
+http://127.0.0.1:8000/docs. POST /tasks keeps its JSON response for curl.
+The dashboard uses POST /tasks/stream for live logs; no background job queue is used.
 
 ## Generate a real local file
 
@@ -66,95 +80,183 @@ the workspace folder is ignored by Git. Later requests can read and edit prior
 files. The agent can create subdirectories by writing paths such as
 `uart-hello/main.c`. Existing `src/target/` code is untouched.
 
-Each request still has a fresh conversation/session and a new ID for logging;
-that ID no longer creates a directory. The agent does not remember earlier chats,
-so tell it which existing files to read. Submit tasks one at a time to avoid
-simultaneous edits to the shared files. Files are not automatically cleared.
+Each chat has a saved conversation/session. Each submitted turn has its own run ID
+for logging; neither ID creates a workspace directory. A follow-up in the same chat
+remembers earlier messages and tool results. A new chat starts with separate
+conversation context but can discover and edit the same current files. Files are
+not automatically cleared, restored, or versioned when switching chats.
+
+## Saved conversations
+
+The sidebar lets you create, select, continue, and delete chats. Chat titles come
+from the first prompt. Each turn shows its prompt, expandable chronological log
+(including QEMU captures), and Markdown answer. Failed/stopped turns keep their
+logs without inventing an answer. Only one run can be active across all chats.
+Switching chats keeps that run going; closing/reloading its browser stream stops
+it. Reopen the chat to read the saved output and send another message.
+
+History lives in `src/orchestration/data/conversations.db`, ignored by Git. ADK
+stores model messages and tool exchanges there; our ChatStore stores the sidebar,
+submitted prompts, visible logs, and final answers. It survives backend restarts.
+Previously running turns are marked interrupted after a restart. Interrupted tool
+requests are closed with an unknown-result message before continuing, rather than
+silently repeating a possible file write or build.
+
+SQLite is included with Python. `aiosqlite` in requirements.txt supplies ADK's async
+adapter; install it with the normal pip requirements command. No database server,
+Homebrew package, or database configuration is required. Back up the data directory
+with the backend stopped. Deleting a chat removes its conversation and logs, but
+keeps workspace files. Earlier runs made before this feature cannot be recovered.
+History grows with messages, source code/tool results, and logs; there is no
+automatic retention or context compaction yet. Long conversations also send more
+context to Gemini and may use more tokens.
+
+API endpoints:
+
+- `GET /chats`: sidebar list and the current active run, if any.
+- `POST /chats`: create an empty chat; returns its `id`.
+- `GET /chats/{id}`: saved turns, logs, and answers.
+- `DELETE /chats/{id}`: delete history, keeping files; stop its active run first.
+- Both task endpoints accept `{"task":"...", "chat_id":"..."}`. Reuse the returned
+  chat ID for follow-ups. Omitting it creates a new saved chat for compatibility
+  with existing curl commands. `session_id` is the chat ID; `run_id` identifies
+  one turn.
+
+Artifact IDs are local to a turn. To run a previous project's firmware in a later
+message, ask the agent to compile that project again before calling run_qemu or
+flash_firmware. The agent is instructed to inspect current files, since another
+chat may have edited them.
 
 In main.py, EnvironmentToolset supplies existing ADK implementations. We select
-its three file tools and register them beside compile_firmware, test_firmware, and flash_firmware.
+its three file tools and register them beside compile_firmware, run_qemu, and flash_firmware.
+An additional ordinary Python tool, `list_directory(path=".")`, discovers existing
+projects in the shared workspace. It returns names, types, and workspace-relative
+paths for one directory level. The agent can then list subdirectories and use
+ReadFile on the returned paths. It rejects paths outside the workspace, including
+links resolving outside it. Results are sorted and capped at 200 entries, with a
+`truncated` flag; it reads no file contents and runs no shell commands.
+
+Try in the dashboard: “List the workspace, explore the source folders, and explain
+what the existing firmware does. Do not change, compile, or run anything.”
+
 The shell Execute tool is not registered. Gemini supplies file paths and contents
 as structured tool arguments; no code-block extractor is used. File tool calls
 and results appear in the same transcript as compile/flash, including code content.
 The compile result has `simulated: false`; the flash result has `simulated: true`.
 The top-level simulation note explains that only flashing remains simulated.
 
-## Real checks, compilation, and QEMU
+## Real compilation
 
-Install the ARM tools and QEMU if needed (no additional Python dependency is required):
+Install both ARM tools if needed (no additional Python dependency is required):
 
 ```sh
 # macOS
 brew install --cask gcc-arm-embedded
-brew install qemu
-# Ubuntu: sudo apt install gcc-arm-none-eabi qemu-system-arm
+# Ubuntu: sudo apt install gcc-arm-none-eabi
+# Windows: winget install --id Arm.GnuArmEmbeddedToolchain -e
 arm-none-eabi-gcc --version
 arm-none-eabi-objcopy --version
-qemu-system-arm --version     # 6.2 or newer
 ```
-
-The agent's tools run in this order, passing the same `artifact_id` along:
-
-```
-compile_firmware(project_dir) -> test_firmware(artifact_id) -> flash_firmware(artifact_id)
-   harness + build (real)          QEMU (real)                     simulated
-```
-
-compile_firmware runs two stages and stops at the first failure. The result's
-`failed_stage` names it (`null` on success):
-
-| Tool / stage | What it checks | Typical failure (blame) |
-|---|---|---|
-| compile: `harness` | `src/build/harness.py` rules: only `src/<name>.c`/`.h`, no libc headers, no `printf`/`malloc`/`free`/`sprintf`, no startup symbols, `int main(void)` present | `#include <stdio.h>` (code) |
-| compile: `build` | `src/build/build.py`: arm-none-eabi-gcc + objcopy | syntax error (code); toolchain missing (rig) |
-| `test_firmware` | `src/build/qemu_gate.py`: boots the build with `qemu-system-arm -M raspi0`; the program must print `HIL:DONE` | hang, crash before `main`, `hil_panic` (code); QEMU missing (rig) |
-
-The harness reads its usual `=== FILE src/<name> ===` text, so the project's `src/`
-files are packed into that format and checked in a temporary folder; the agent's
-project folder is never modified by the harness.
-
-test_firmware works like flash_firmware: it only accepts the exact `artifact_id`
-from the latest successful compile_firmware in this task, and rejects anything
-else without running QEMU. It runs in its own subfolder of the project:
-
-```
-build-demo/
-  src/main.c            the agent's code
-  kernel.elf, kernel.bin, build.log    from compile_firmware
-  test_firmware/
-    kernel.elf          copy of the build that was tested
-    qemu.log            QEMU console output (HIL:BOOT ... HIL:DONE)
-```
-
-The result includes the console output (`console`) and the folder (`test_dir`).
 
 For example, have the agent write `build-demo/src/main.c`, then call
 `compile_firmware(project_dir="build-demo")`. The directory must be inside the
 shared workspace. With no argument, the tool builds the workspace root and expects
-`src/*.c` there. The existing build stage compiles direct children of `src/`, not
+`src/*.c` there. The compiler helper compiles direct children of `src/`, not
 arbitrarily nested sources. A standalone file such as `uart-hello/main.c` must be
 placed under `uart-hello/src/main.c` before using that project layout.
 
 Before each build, orchestration copies the fixed `start.S`, `linker.ld`, `hil.c`,
-and `hil.h` files from `src/build/target/` into the project root, replacing those
+and `hil.h` files from `src/orchestration/firmware/` into the project root, replacing those
 support copies. Generated firmware should not edit them. Use freestanding C with
 `int main(void)`; libc/stdio are unavailable. For UART output, include `hil.h` and
-use `hil_puts`. Then the existing `build.run(project)` compiles and links the code
+use `hil_puts`. Then `compiler.run(project)` compiles and links the code
 and produces `kernel.elf`, `kernel.bin`, and `build.log` in that project.
 
-The blocking harness, build, and QEMU steps run in a worker thread so terminal heartbeats and other HTTP
-requests can continue. A successful compile returns an artifact ID and the existing
-build metadata: ELF/binary paths, byte length, and CRC32. The flash stub accepts the
-ID only after that same build passed test_firmware in this task. A new compile, or a
-failed test, clears it.
+All Python and firmware support for this agent MVP lives in this directory:
 
-Rule violations, compiler errors, and QEMU failures return `status: error`,
-`blame: code`, and feedback Gemini can use to edit the file and compile again.
-Missing tools/support files are setup failures (`blame: rig`); the agent should
-report them rather than rewrite firmware. QEMU does not model real timing, so
-passing it does not prove timing on hardware. Hardware execution and UART/FPGA
-collection are not called by this integration.
+```text
+src/orchestration/
+  main.py             FastAPI, ADK agent, and tools
+  compiler.py         ARM compiler invocation and structured build results
+  qemu.py             bounded execution and UART/diagnostic capture
+  firmware/
+    start.S           stack/BSS setup, then hil_init -> main -> hil_exit
+    linker.ld         memory layout and entry point
+    hil.c             UART output, status markers, GPIO helpers
+    hil.h             declarations and register definitions
+  workspaces/         persistent generated projects and build output (ignored by Git)
+```
+
+The compiler helper and templates were adapted from the separate `src/build/`
+pipeline, but orchestration does not import or copy files from it anymore.
+External requirements are still the Python packages and ARM toolchain.
+Change the templates in `firmware/`, not generated workspace copies: the next
+compile refreshes the copies. After main returns, hil_exit prints `HIL:DONE` and
+loops without requesting a watchdog reset. QEMU stays open until stopped.
+hil_panic retains its existing watchdog reset behavior on an explicit failure.
+
+The blocking build runs in a worker thread so terminal heartbeats and other HTTP
+requests can continue. Success returns an artifact ID and the existing build
+metadata: ELF/binary paths, byte length, and CRC32. The flash stub accepts the ID
+only from the latest successful build in this task. A failed rebuild clears it.
+
+Compiler errors return `status: error`, `blame: code`, and feedback Gemini can
+use to edit the file and compile again. Missing tools/support files are setup
+failures (`blame: rig`); the agent should report them rather than rewrite firmware.
+A successful compilation does not establish correct runtime behavior. Use run_qemu
+for emulator observations. Physical hardware execution and FPGA capture remain future work.
 LocalEnvironment is a local development tool, not an OS sandbox.
+
+## Observe firmware in QEMU
+
+Install QEMU if needed: `brew install qemu` on macOS,
+`sudo apt install qemu-system-arm` on Ubuntu, or
+`winget install SoftwareFreedomConservancy.QEMU` on Windows (or the installer
+from https://qemu.weilnetz.de/w64/). Make sure `qemu-system-arm` is on PATH;
+`QEMU_PATH` can point at the executable instead. No extra Python dependency is
+needed.
+
+On Windows, `uvicorn --reload` runs the app on the Selector event loop, which
+cannot create subprocesses. Observation falls back to a background thread in
+that case, so `run_qemu` works with or without `--reload`; the returned fields
+are identical.
+
+Restart the backend, then in another terminal:
+
+```sh
+curl -sS --max-time 90 http://127.0.0.1:8000/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"task":"Use WriteFile to create qemu-demo/src/main.c that includes hil.h and defines int main(void) which calls hil_puts with Hello from firmware, then returns 0. Compile project qemu-demo. If compilation succeeds, call run_qemu with the returned artifact_id and duration_seconds 1. Interpret its uart_output and qemu_errors, report what was observed, and finish. Do not flash."}' \
+  | python3 -m json.tool
+```
+
+The agent calls `run_qemu(artifact_id, duration_seconds=1.0)`. The ID must come
+from the latest successful compile in this task. Each call starts a fresh QEMU
+process, collects output, stops it, and returns the observation to Gemini through
+ADK's normal tool-result flow. It does not keep an emulator running between calls.
+
+The helper launches the same `qemu-system-arm -M raspi0 -kernel ... -display none
+-serial stdio -monitor none` command used manually, with stdout/stderr pipes.
+It drains both pipes while running. The observation defaults to one second and
+can be greater than zero up to ten seconds. Startup and cleanup add overhead.
+The process is also stopped and reaped if the agent task is cancelled.
+
+The tool returns `uart_output`, `qemu_errors`, `observed_seconds`, `execution_status`,
+`stopped_by`, and `exit_code`. An observation ending normally has
+`execution_status: observation_complete` and `stopped_by: observation_limit`;
+`exit_code` is null because Python intentionally stopped QEMU. An early process
+exit includes its exit code. Missing QEMU or ELF returns an infrastructure error.
+Output is limited to the first 64 KiB per stream, with truncation flags; excess
+bytes are drained and discarded to avoid blocking the emulator or growing RAM usage.
+
+The UART log and diagnostics appear in `tool_events` in the API response and the
+backend terminal. Gemini can interpret them, edit files, rebuild, and run again.
+`HIL:DONE` does not stop observation early; firmware that loops forever is also
+observed for the chosen window. Tool success means output collection completed,
+not that firmware passed a test. Empty output, HIL:PANIC, or unexpected text are
+evidence for the agent to interpret against your task. This is not an FPGA trace
+or a measurement of real hardware timing. No mandatory QEMU pass gate is added
+to the simulated flash tool. Rebuilding invalidates the previous run's artifact ID.
 
 ## Long waits and test prompts
 
@@ -180,32 +282,32 @@ backend before retrying so the earlier run does not remain active.
 
 1. FastAPI validates TaskRequest: nonblank text, at most 10,000 characters.
 2. The endpoint checks GOOGLE_API_KEY and awaits run_agent_loop.
-3. That function defines compile_firmware, test_firmware, and flash_firmware, with build state
+3. That function defines compile_firmware, run_qemu, and flash_firmware, with build state
    private to this request. ADK turns their names, docstrings, and type annotations
    into tool descriptions Gemini can use.
 4. ADK's EnvironmentToolset supplies three local file tools in the shared workspace.
-   An Agent gives Gemini instructions, those file tools, the real compile and
-   QEMU test tools, and the simulated flash tool. An InMemoryRunner creates
-   a fresh session and manages model/tool/model turns. A session holds this run's
-   conversation and tool results in RAM; no conversation is reused across tasks.
-5. For the example prompt, Gemini is instructed to compile, then test, then flash,
-   passing the exact returned artifact ID along. Python does not preselect these calls.
-   test_firmware rejects an unknown ID or a call before a build; the flash stub
-   rejects anything that has not passed test_firmware.
+   An Agent gives Gemini instructions, those file tools, the real compile/QEMU tools,
+   and simulated flash tool. A Runner creates
+   or loads a saved session and manages model/tool/model turns. A session holds
+   this chat's messages and tool results in SQLite and is reused for follow-ups.
+5. For the example prompt, Gemini is instructed to compile first and then pass the
+   exact returned artifact ID to flash. Python does not preselect these calls.
+   The flash stub rejects an unknown ID or a call before a build.
 6. The runner executes requested tools and feeds results back to Gemini. Our event
    loop collects tool calls/results and the final answer, excluding thought parts.
-7. FastAPI returns JSON; the runner is closed and its session is not persisted.
+7. FastAPI saves the answer and returns JSON; the runner closes while the session
+   and visible logs remain in SQLite. The stream endpoint delivers logs as they happen.
 
-The runner allows at most eight model calls per task. Tool selection and wording
+The runner allows at most 30 model calls per task. Tool selection and wording
 are model-driven, so inspect tool_events to see what actually happened. HTTP 200
 means an answer was returned, not that real firmware was tested. Missing API key
 returns 503; invalid task input returns 422; an unsuccessful Gemini/ADK run returns
 502 without exposing provider internals.
 
-The compile and test tools reuse the harness, build, and QEMU stages directly; they
-do not call the unfinished runner. The flash stub only checks the artifact ID.
-No general shell tool, runtime firmware validation, hardware
-protocols, UART/FPGA retrieval, authentication, or dashboard integration is included.
+The compile tool uses this directory's compiler.py; it does not call src/build,
+the harness, or the rest of that pipeline. The flash stub only checks the artifact ID.
+No general shell tool, automatic firmware test verdict, physical hardware
+protocols, FPGA retrieval, or authentication is included.
 Orchestration owns agent decisions and limits; runner will own concrete hardware
 operations. Its unresolved interfaces are documented in src/runner/README.md.
 
@@ -213,17 +315,43 @@ operations. Its unresolved interfaces are documented in src/runner/README.md.
 
 ```sh
 python -m pip install -r src/orchestration/requirements-dev.txt
-python -m unittest src.orchestration.test_api
+python -m unittest src.orchestration.test_api src.orchestration.test_qemu src.orchestration.test_history src.orchestration.test_stream
 ```
 
-Tests replace the model transport. Most mock the harness rules, build stage, and
-QEMU gate (passing by default) to test ADK plumbing; integration tests use the
-installed ARM compiler (and QEMU for one end-to-end test) and are skipped if absent.
-They verify harness rejection before gcc runs, test_firmware running QEMU in the
-project's test_firmware/ folder and rejecting unknown IDs, flashing only after a
-passing test, QEMU failures blocking flashing,
-real binary creation and metadata, compiler-error feedback and repair,
-missing tools, invalidation after a failed rebuild, artifact handoff, fresh
-sessions, real file write/read/edit and persistence, workspace path rejection,
+Tests replace the model transport. Most mock the build stage to test ADK plumbing;
+integration tests use the installed ARM compiler and are skipped if it is absent.
+They verify real binary creation and metadata, compiler-error feedback and repair,
+QEMU UART feedback reaching the model, bounded process cleanup (including cancellation),
+early errors and bounded output buffers,
+missing tools, invalidation after a failed rebuild, artifact handoff, separate chats and reused
+sessions after restart, saved logs/errors, chat deletion without deleting files, real file write/read/edit and persistence, workspace path rejection,
 shell-tool exclusion, thought filtering, request validation, and error responses. They do not
 verify Gemini connectivity, credentials, quota, or real model tool selection.
+
+## Dashboard streaming and Stop
+
+Start this backend on 127.0.0.1:8000, then run `npm run dev` in src/dashboard and
+open Vite's Local URL. The frontend proxies /api to this backend. Run submits one
+prompt and streams application log messages, inline QEMU UART captures, and the
+final answer. It does not manufacture progress stages or firmware test verdicts.
+
+`POST /tasks/stream?run_id=<UUID>` accepts the same task JSON as /tasks. It returns
+application/x-ndjson: each line is either a `log` event (run_id, timestamp, source,
+message, optional details) or a `final` event containing the result. QEMU UART is
+labeled `QEMU UART`; emulator diagnostics are labeled `QEMU`. Provider errors are
+redacted and sent as Error log entries. No prompts or model thought parts are
+logged. HTTP validation, missing-key, and busy errors happen before streaming.
+
+`POST /tasks/<UUID>/stop` cancels that active run and waits for cleanup. Closing
+the stream also cancels the run. Cancelled QEMU observations terminate their child
+processes. A compiler already running in a worker thread finishes before the
+workspace is released, so Stop may briefly wait. The log explains this wait.
+
+Both task endpoints share one active-run limit per backend process. A second run
+returns 409 rather than editing the shared files concurrently. Use a single
+Uvicorn worker for this local MVP. Sessions, prompts, answers, and logs persist
+in SQLite. A stopped run is not automatically resumed; send a follow-up in its chat.
+The existing POST /tasks still returns its complete JSON result.
+
+The HTTP streaming tests bind a temporary loopback port and verify events arriving
+before completion, conflict rejection, Stop cleanup, and cancellation on disconnect.
