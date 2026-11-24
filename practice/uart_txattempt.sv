@@ -41,3 +41,35 @@ module uart_tx #(
 
     tx = frame[0]; // tx takes the LSB of the frame
 endmodule
+
+
+module top {
+    output logic [7:0] data;
+    input logic clk;
+    input logic busy;
+}
+logic charnum;
+
+always_ff(@posedge clk) begin
+    if (!busy) begin
+        if (charnum == 0)
+            data <= "H";
+            else if (charnum == 1)
+            data <= "E";
+            else if (charnum == 2)
+            data <= "L";
+            else if (charnum == 3)
+            data <= "L";
+            else if (charnum == 4)
+            data <= "O";
+            else if (charnum == 5)
+            data <= "\r";
+            else if (charnum == 6)
+            data <= "\n";
+
+        charnum <= charnum + 1'b1;
+    end
+
+end
+
+endmodule
