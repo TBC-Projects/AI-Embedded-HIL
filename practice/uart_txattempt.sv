@@ -16,7 +16,7 @@ module uart_tx #(
 
     // https://easyfpga.blog/posts/uart-implementation-ep5/
 
-    always_ff (@posedge clk or posedge rst) begin
+    always_ff @(posedge clk or posedge rst) begin
         if (rst) begin // initializing everything
             tx <= 1'b1;
             busy <= 1'b0;
@@ -39,19 +39,20 @@ module uart_tx #(
         end
     end
 
-    tx = frame[0]; // tx takes the LSB of the frame
+    assign tx = frame[0]; // tx takes the LSB of the frame
 endmodule
 
 
-module top {
-    output logic [7:0] data;
-    input logic clk;
-    input logic busy;
-    input logic rst;
-}
+module top (
+    output logic [7:0] data,
+    input logic clk,
+    input logic busy,
+    input logic rst
+);
+
 logic charnum;
 
-always_ff(@posedge clk or posedge rst) begin
+always_ff @(posedge clk or posedge rst) begin
     if (rst) begin
         charnum <= '0;
     end else if (!busy) begin
