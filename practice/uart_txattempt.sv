@@ -47,11 +47,14 @@ module top {
     output logic [7:0] data;
     input logic clk;
     input logic busy;
+    input logic rst;
 }
 logic charnum;
 
-always_ff(@posedge clk) begin
-    if (!busy) begin
+always_ff(@posedge clk or posedge rst) begin
+    if (rst) begin
+        charnum <= '0;
+    end else if (!busy) begin
         if (charnum == 0)
             data <= "H";
             else if (charnum == 1)
